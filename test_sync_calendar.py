@@ -1,594 +1,847 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""sync_calendar 单元测试。
+
+运行: .venv/bin/python -m pytest test_sync_calendar.py -v
+
+EventKit 需要 macOS 授权，没法在测试里真的读写提醒事项，
+所以这里用 FakeApple / FakeZectrix 替身把双向同步引擎的每条分支都跑一遍。
 """
-单元测试 for CalendarSyncer
-使用 pytest 框架，运行方式: pytest test_sync_calendar.py -v
-"""
-import pytest
 import datetime
-from unittest.mock import Mock, patch, MagicMock
-
-from sync_calendar import CalendarSyncer
-
-
-class TestExtractUidFromDescription:
-    """测试 extract_uid_from_description UID 提取功能"""
-
-    def test_empty_description(self):
-        """空描述返回空字符串"""
-        syncer = CalendarSyncer()
-        assert syncer.extract_uid_from_description("") == ""
-
-    def test_no_uid_line(self):
-        """没有UID行返回空字符串"""
-        syncer = CalendarSyncer()
-        description = "从邮箱日历同步\n这是普通文本"
-        assert syncer.extract_uid_from_description(description) == ""
-
-    def test_uid_at_start(self):
-        """UID在行首"""
-        syncer = CalendarSyncer()
-        description = "从邮箱日历同步\nUID: abc123-xyz"
-        assert syncer.extract_uid_from_description(description) == "abc123-xyz"
-
-    def test_uid_with_spaces(self):
-        """UID前后有空格"""
-        syncer = CalendarSyncer()
-        description = "从邮箱日历同步\n   UID:   abc123   "
-        assert syncer.extract_uid_from_description(description) == "abc123"
-
-    def test_uid_multiple_lines(self):
-        """多行文本，只返回第一个UID"""
-        syncer = CalendarSyncer()
-        description = "从邮箱日历同步\nUID: first\nUID: second"
-        assert syncer.extract_uid_from_description(description) == "first"
-
-
-class TestIsExpired:
-    """测试 is_expired 过期判断"""
-
-    @pytest.mark.parametrize(
-        "hours_ago, expected",
-        [
-            (0, False),  # 刚发生，不过期
-            (0.5, False),  # 半小时前，不超过默认1小时，不过期
-            (2, True),  # 2小时前，超过默认1小时，过期
-        ]
-    )
-    def test_is_expired_with_different_times(self, hours_ago, expected):
-        """测试不同时间点的过期判断"""
-        syncer = CalendarSyncer()
-        # EXPIRE_HOURS 默认是 1 小时
-        target_time = datetime.datetime.now() - datetime.timedelta(hours=hours_ago)
-        dueDate = target_time.strftime("%Y-%m-%d")
-        dueTime = target_time.strftime("%H:%M")
-
-        # 因为 EXPIRE_HOURS 是模块级变量，默认是 1
-        result = syncer.is_expired(dueDate, dueTime)
-        # 允许一秒误差，所以用近似判断
-        if hours_ago > 1:
-            assert result is True
-        elif hours_ago < 1:
-            assert result is False
-
-    def test_invalid_time_format(self):
-        """时间格式错误返回 False，不抛出异常"""
-        syncer = CalendarSyncer()
-        assert syncer.is_expired("2024/03/27", "10:00") is False
-        assert syncer.is_expired("not-a-date", "not-a-time") is False
-
-
-class TestFindExistingTodoByUid:
-    """测试 find_existing_todo_by_uid 查找功能"""
-
-    def test_empty_existing_todos(self):
-        """没有待办时返回 None"""
-        syncer = CalendarSyncer()
-        syncer.existing_todos = []
-        assert syncer.find_existing_todo_by_uid("test-uid") is None
-
-    def test_uid_not_found(self):
-        """找不到对应UID返回 None"""
-        syncer = CalendarSyncer()
-        syncer.existing_todos = [
-            {
-                "id": 1,
-                "title": "[日历] 开会",
-                "description": "从邮箱日历同步\nUID: uid1",
-                "dueDate": "2024-03-27",
-                "dueTime": "10:00",
-            }
-        ]
-        assert syncer.find_existing_todo_by_uid("other-uid") is None
-
-    def test_uid_found(self):
-        """找到对应UID返回待办"""
-        syncer = CalendarSyncer()
-        todo = {
-            "id": 1,
-            "title": "[日历] 开会",
-            "description": "从邮箱日历同步\nUID: uid123",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-        }
-        syncer.existing_todos = [todo]
-        syncer._uid_map = {"uid123": todo}
-        result = syncer.find_existing_todo_by_uid("uid123")
-        assert result is todo
-
-
-class TestRetryWithBackoff:
-    """测试 retry_with_backoff 重试机制"""
-
-    def test_success_first_attempt(self):
-        """第一次成功直接返回"""
-        syncer = CalendarSyncer()
-        mock_func = Mock(return_value="success")
-        result = syncer.retry_with_backoff(mock_func)
-        assert result == "success"
-        mock_func.assert_called_once()
-
-    def test_success_after_retry(self):
-        """失败几次后成功返回"""
-        syncer = CalendarSyncer()
-        syncer.max_retries = 3
-        mock_func = Mock(side_effect=[False, False, "success"])
-        with patch('time.sleep'):  # 不实际等待
-            result = syncer.retry_with_backoff(mock_func)
-        assert result == "success"
-        assert mock_func.call_count == 3
-
-    def test_all_attempts_fail_return_none(self):
-        """全部失败后返回 None"""
-        syncer = CalendarSyncer()
-        syncer.max_retries = 3
-        mock_func = Mock(return_value=False)
-        with patch('time.sleep'):
-            result = syncer.retry_with_backoff(mock_func)
-        assert result is None
-        assert mock_func.call_count == 3
-
-    def test_exception_then_success(self):
-        """抛出异常后重试成功"""
-        syncer = CalendarSyncer()
-        syncer.max_retries = 2
-        mock_func = Mock(side_effect=[Exception("test error"), "success"])
-        with patch('time.sleep'):
-            result = syncer.retry_with_backoff(mock_func)
-        assert result == "success"
-        assert mock_func.call_count == 2
-
-
-class TestSyncNewEvents:
-    """测试 sync_new_events 同步逻辑"""
-
-    def setup_method(self):
-        self.syncer = CalendarSyncer()
-        self.syncer.existing_todos = []
-        self.syncer._uid_map = {}
-
-    def test_creates_new_todo_when_uid_not_exists(self, mocker):
-        """当UID不存在时创建新待办"""
-        mock_create = mocker.patch.object(self.syncer, 'create_todo', return_value=True)
-        events = [{
-            "uid": "new-uid",
-            "title": "测试会议",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-        }]
-
-        self.syncer.sync_new_events(events)
-
-        mock_create.assert_called_once_with("new-uid", "测试会议", "2024-03-27", "10:00")
-
-    def test_does_not_create_when_no_uid(self, mocker):
-        """没有UID的事件不创建"""
-        mock_create = mocker.patch.object(self.syncer, 'create_todo', return_value=True)
-        events = [{
-            "uid": "",
-            "title": "测试会议",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-        }]
-
-        self.syncer.sync_new_events(events)
-
-        mock_create.assert_not_called()
-
-    def test_updates_todo_when_content_changed(self, mocker):
-        """内容变化时更新已有待办"""
-        mock_update = mocker.patch.object(self.syncer, 'update_todo', return_value=True)
-        todo = {
-            "id": 123,
-            "uid": "existing-uid",
-            "title": "[日历] 旧标题",
-            "description": "从邮箱日历同步\nUID: existing-uid",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-            "status": 0,
-        }
-        self.syncer.existing_todos = [todo]
-        self.syncer._uid_map = {"existing-uid": todo}
-        events = [{
-            "uid": "existing-uid",
-            "title": "新标题",
-            "dueDate": "2024-03-27",
-            "dueTime": "14:00",  # 时间变了
-        }]
-
-        self.syncer.sync_new_events(events)
-
-        mock_update.assert_called_once()
-        args = mock_update.call_args
-        assert args[0][0] == 123
-        assert args[0][1] == "existing-uid"
-        assert args[0][2] == "新标题"
-
-    def test_no_update_when_content_unchanged(self, mocker):
-        """内容不变不更新"""
-        mock_update = mocker.patch.object(self.syncer, 'update_todo', return_value=True)
-        todo = {
-            "id": 123,
-            "uid": "existing-uid",
-            "title": "[日历] 测试会议",
-            "description": "从邮箱日历同步\nUID: existing-uid",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-            "status": 0,
-        }
-        self.syncer.existing_todos = [todo]
-        self.syncer._uid_map = {"existing-uid": todo}
-        events = [{
-            "uid": "existing-uid",
-            "title": "测试会议",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-        }]
-
-        self.syncer.sync_new_events(events)
-
-        mock_update.assert_not_called()
-
-    def test_deletes_todo_when_uid_missing_from_current(self, mocker):
-        """当前列表中没有的UID需要删除"""
-        mock_delete = mocker.patch.object(self.syncer, 'delete_todo', return_value=True)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "[日历] 已删除会议",
-            "description": "从邮箱日历同步\nUID: deleted-uid",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-            "status": 0,
-        }]
-        events = [{
-            "uid": "existing-uid",
-            "title": "保留会议",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-        }]
-
-        self.syncer.sync_new_events(events)
-
-        mock_delete.assert_called_once_with(123)
-
-    def test_ignores_completed_todos_during_cleanup(self, mocker):
-        """已完成的待办不清理"""
-        mock_delete = mocker.patch.object(self.syncer, 'delete_todo', return_value=True)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "[日历] 已完成会议",
-            "description": "从邮箱日历同步\nUID: old-uid",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-            "status": 1,  # 已完成
-        }]
-        events = []
-
-        self.syncer.sync_new_events(events)
-
-        mock_delete.assert_not_called()
-
-    def test_ignores_non_calendar_todos_during_cleanup(self, mocker):
-        """不是[日历]开头的待办不清理"""
-        mock_delete = mocker.patch.object(self.syncer, 'delete_todo', return_value=True)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "普通待办",
-            "description": "普通描述",
-            "dueDate": "2024-03-27",
-            "dueTime": "10:00",
-            "status": 0,
-        }]
-        events = []
-
-        self.syncer.sync_new_events(events)
-
-        mock_delete.assert_not_called()
-
-
-class TestCompleteExpiredCalendarTodos:
-    """测试 complete_expired_calendar_todos 过期清理"""
-
-    def setup_method(self):
-        self.syncer = CalendarSyncer()
-        self.syncer.existing_todos = []
-
-    def test_completes_expired_calendar_todo(self, mocker):
-        """过期的日历待办被标记为完成"""
-        mock_complete = mocker.patch.object(self.syncer, 'complete_todo', return_value=True)
-        mock_is_expired = mocker.patch.object(self.syncer, 'is_expired', return_value=True)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "[日历] 过期会议",
-            "dueDate": "2024-03-26",
-            "dueTime": "10:00",
-            "status": 0,
-        }]
-
-        self.syncer.complete_expired_calendar_todos()
-
-        mock_complete.assert_called_once_with(123)
-
-    def test_skips_non_expired_calendar_todo(self, mocker):
-        """未过期不标记"""
-        mock_complete = mocker.patch.object(self.syncer, 'complete_todo', return_value=True)
-        mock_is_expired = mocker.patch.object(self.syncer, 'is_expired', return_value=False)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "[日历] 未过期会议",
-            "dueDate": "2024-03-27",
-            "dueTime": "14:00",
-            "status": 0,
-        }]
-
-        self.syncer.complete_expired_calendar_todos()
-
-        mock_complete.assert_not_called()
-
-    def test_skips_already_completed(self, mocker):
-        """已完成跳过"""
-        mock_complete = mocker.patch.object(self.syncer, 'complete_todo', return_value=True)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "[日历] 过期会议",
-            "dueDate": "2024-03-26",
-            "dueTime": "10:00",
-            "status": 1,  # 已完成
-        }]
-
-        self.syncer.complete_expired_calendar_todos()
-
-        mock_complete.assert_not_called()
-
-    def test_skips_non_calendar_todo(self, mocker):
-        """非日历待办跳过"""
-        mock_complete = mocker.patch.object(self.syncer, 'complete_todo', return_value=True)
-        self.syncer.existing_todos = [{
-            "id": 123,
-            "title": "普通待办",
-            "dueDate": "2024-03-26",
-            "dueTime": "10:00",
-            "status": 0,
-        }]
-
-        self.syncer.complete_expired_calendar_todos()
-
-        mock_complete.assert_not_called()
-
-
-class TestParseCaldavEvent:
-    """测试 parse_caldav_event 事件解析"""
-
-    def test_skips_cancelled_event(self):
-        """跳过已取消事件"""
-        syncer = CalendarSyncer()
-        # 创建一个模拟 event 对象
-        mock_event = Mock()
-        mock_event.data = """
-BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-SUMMARY:已取消 会议
-UID:test123
-DTSTART;VALUE=DATE:20240327
-END:VEVENT
-END:VCALENDAR
-"""
-        result = syncer.parse_caldav_event(mock_event)
-        # 因为日期不在未来24小时内，可能返回空，但至少验证它不会返回已取消事件
-        # 我们主要验证已取消逻辑被触发
-        assert isinstance(result, list)
-
-    def test_handles_all_day_event(self):
-        """处理全天事件 - 验证全天事件被正确格式化为 09:00"""
-        syncer = CalendarSyncer()
-        mock_event = Mock()
-        # 明天的全天事件
-        tomorrow = datetime.datetime.now() + datetime.timedelta(days=1)
-        date_str = tomorrow.strftime("%Y%m%d")
-        mock_event.data = f"""
-BEGIN:VCALENDAR
-VERSION:2.0
-BEGIN:VEVENT
-SUMMARY:全天会议
-UID:test123
-DTSTART;VALUE=DATE:{date_str}
-END:VEVENT
-END:VCALENDAR
-"""
-        result = syncer.parse_caldav_event(mock_event)
-        # 明天距离现在是否在24小时内取决于当前时间，所以我们不强制长度断言
-        # 如果返回了结果，验证格式正确
-        if len(result) > 0:
-            event = result[0]
-            assert "uid" in event
-            assert event["uid"] == "test123"
-            assert event["dueTime"] == "09:00"
-        else:
-            # 如果超过24小时被过滤了，说明过滤逻辑工作正常
-            pass
-
-
-class TestApiCalls:
-    """测试 API 调用方法（使用 mock）"""
-
-    def test_get_existing_todos_success(self, mocker):
-        """成功获取待办列表"""
-        syncer = CalendarSyncer()
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {
-            "code": 0,
-            "data": [{"id": 1, "title": "test"}]
-        }
-        mock_get = mocker.patch('requests.get', return_value=mock_response)
-
-        with patch.object(syncer, 'retry_with_backoff', return_value=[{"id": 1, "title": "test"}]):
-            result = syncer.get_existing_todos()
-
-        assert len(result) == 1
-        assert result[0]["id"] == 1
-
-    def test_get_existing_todos_failure_returns_empty(self, mocker):
-        """API失败返回空列表"""
-        syncer = CalendarSyncer()
-        mocker.patch.object(syncer, 'retry_with_backoff', return_value=None)
-        result = syncer.get_existing_todos()
-        assert result == []
-
-    def test_complete_todo_success(self, mocker):
-        """成功标记完成"""
-        syncer = CalendarSyncer()
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {"code": 0}
-        mock_put = mocker.patch('requests.put', return_value=mock_response)
-
-        def _mock_retry(func, *args, **kwargs):
-            return func()
-
-        with patch.object(syncer, 'retry_with_backoff', side_effect=_mock_retry):
-            result = syncer.complete_todo(123)
-
-        assert result is True
-
-    def test_complete_todo_failure_returns_false(self, mocker):
-        """标记失败返回 False"""
-        syncer = CalendarSyncer()
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {"code": 1, "msg": "error"}
-        mock_put = mocker.patch('requests.put', return_value=mock_response)
-
-        def _mock_retry(func, *args, **kwargs):
-            return func()
-
-        with patch.object(syncer, 'retry_with_backoff', side_effect=_mock_retry):
-            result = syncer.complete_todo(123)
-
-        assert result is False
-
-
-class TestCalendarSyncerInit:
-    """测试初始化"""
-
-    def test_init_sets_headers(self):
-        """初始化设置正确的请求头"""
-        import sync_calendar
-        original_key = sync_calendar.API_KEY
-        sync_calendar.API_KEY = "test-key"
-        syncer = CalendarSyncer()
-        assert syncer.headers["X-API-Key"] == "test-key"
-        assert syncer.headers["Content-Type"] == "application/json"
-        sync_calendar.API_KEY = original_key
-
-    def test_init_sets_defaults(self):
-        """初始化设置默认值"""
-        syncer = CalendarSyncer()
-        assert syncer.existing_todos == []
-        assert syncer.max_retries == 3
-
-    def test_init_dry_run_default_false(self):
-        """默认不启用dry_run"""
-        syncer = CalendarSyncer()
-        assert syncer.dry_run is False
-
-    def test_init_dry_run_enabled(self):
-        """启用dry_run"""
-        syncer = CalendarSyncer(dry_run=True)
-        assert syncer.dry_run is True
-
+import json
+import os
+
+import pytest
+
+import sync_calendar as sc
+from sync_calendar import ARem, ReminderSync, SyncState, Task, ZTodo
+
+
+TODAY = datetime.date.today().strftime("%Y-%m-%d")
+YESTERDAY = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+TOMORROW = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def task(title="喝水", date=None, time="10:00", completed=False) -> Task:
+    return Task(title=title, due_date=date or TODAY, due_time=time, completed=completed)
+
+
+# --------------------------------------------------------------------------
+# 替身
+# --------------------------------------------------------------------------
+
+class FakeZectrix:
+    """在内存里模拟 Zectrix 云端。"""
+
+    def __init__(self, todos=None, dry_run=False):
+        self.dry_run = dry_run
+        self.todos = {t.todo_id: t for t in (todos or [])}
+        self._next_id = max(self.todos, default=1000) + 1
+        self.calls = []
+
+    def create(self, task, description, priority=0):
+        self.calls.append(("create", task, description))
+        if self.dry_run:
+            return None
+        todo_id = self._next_id
+        self._next_id += 1
+        self.todos[todo_id] = ZTodo(todo_id=todo_id, task=task,
+                                    description=description, updated_at=0)
+        return todo_id
+
+    def update_fields(self, todo_id, task, description):
+        self.calls.append(("update", todo_id, task, description))
+        old = self.todos[todo_id]
+        merged = Task(task.title, task.due_date, task.due_time, old.task.completed)
+        self.todos[todo_id] = ZTodo(todo_id, merged, description, old.updated_at)
+        return True
+
+    def set_completed(self, todo_id, task, description, completed):
+        self.calls.append(("set_completed", todo_id, completed))
+        old = self.todos[todo_id]
+        merged = Task(old.task.title, old.task.due_date, old.task.due_time, completed)
+        self.todos[todo_id] = ZTodo(todo_id, merged, old.description, old.updated_at)
+        return True
+
+    def delete(self, todo_id):
+        self.calls.append(("delete", todo_id))
+        self.todos.pop(todo_id, None)
+        return True
+
+    def kinds(self):
+        return [c[0] for c in self.calls]
+
+
+class FakeApple:
+    """在内存里模拟 Apple 提醒事项。"""
+
+    def __init__(self, reminders=None, dry_run=False):
+        self.dry_run = dry_run
+        self.items = {r.apple_id: r for r in (reminders or [])}
+        self._next = 1
+        self.calls = []
+
+    def fetch_all(self):
+        return list(self.items.values())
+
+    def lookup(self, apple_id, ext_id=""):
+        if apple_id in self.items:
+            return self.items[apple_id]
+        for rem in self.items.values():
+            if ext_id and rem.ext_id == ext_id:
+                return rem
+        return None
+
+    def create(self, task):
+        self.calls.append(("create", task))
+        if self.dry_run:
+            return None
+        apple_id = f"new-{self._next}"
+        self._next += 1
+        rem = ARem(apple_id=apple_id, ext_id=f"ext-{apple_id}", task=task,
+                   updated_at=0, list_name="提醒事项")
+        self.items[apple_id] = rem
+        return rem
+
+    def update(self, rem, task):
+        self.calls.append(("update", rem.apple_id, task))
+        self.items[rem.apple_id] = ARem(rem.apple_id, rem.ext_id, task,
+                                        rem.updated_at, rem.list_name)
+        return True
+
+    def delete(self, rem):
+        self.calls.append(("delete", rem.apple_id))
+        self.items.pop(rem.apple_id, None)
+        return True
+
+    def kinds(self):
+        return [c[0] for c in self.calls]
+
+
+@pytest.fixture
+def state(tmp_path):
+    return SyncState(str(tmp_path / "state.json"))
+
+
+def build(state, z_todos=(), reminders=(), dry_run=False):
+    zectrix = FakeZectrix(z_todos, dry_run=dry_run)
+    apple = FakeApple(reminders, dry_run=dry_run)
+    engine = ReminderSync(zectrix, apple, state, dry_run=dry_run)
+    return zectrix, apple, engine
+
+
+@pytest.fixture(autouse=True)
+def default_policy(monkeypatch):
+    monkeypatch.setattr(sc, "DELETE_POLICY", "apple-master")
+    monkeypatch.setattr(sc, "SYNC_DAYS_BACK", 0)
+    monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", 0)
+    monkeypatch.setattr(sc, "SYNC_NEW_COMPLETED", False)
+
+
+# --------------------------------------------------------------------------
+# Task / 时间归一化
+# --------------------------------------------------------------------------
+
+class TestTask:
+    def test_roundtrip(self):
+        t = task(completed=True)
+        assert Task.from_dict(t.to_dict()) == t
+
+    def test_equality_is_by_value(self):
+        assert task() == task()
+        assert task() != task(completed=True)
+        assert task() != task(time="11:00")
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("9:5", "09:05"),
+        ("09:05:00", "09:05"),
+        ("23:59", "23:59"),
+        ("", sc.DEFAULT_DUE_TIME),
+        ("垃圾", sc.DEFAULT_DUE_TIME),
+    ])
+    def test_normalize_time(self, raw, expected):
+        assert sc._normalize_time(raw) == expected
+
+
+class TestWindow:
+    def test_today_in_window(self):
+        assert ReminderSync.in_window(TODAY)
+
+    def test_tomorrow_out_of_window_by_default(self):
+        assert not ReminderSync.in_window(TOMORROW)
+
+    def test_days_ahead_extends_window(self, monkeypatch):
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", 1)
+        assert ReminderSync.in_window(TOMORROW)
+
+    def test_bad_date(self):
+        assert not ReminderSync.in_window("")
+
+
+# --------------------------------------------------------------------------
+# 新建
+# --------------------------------------------------------------------------
+
+class TestCreate:
+    def test_new_reminder_creates_todo(self, state):
+        rem = ARem("a1", "e1", task("买牛奶"), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+
+        assert len(zectrix.todos) == 1
+        created = next(iter(zectrix.todos.values()))
+        assert created.task == task("买牛奶")
+        # 备注里存跨设备稳定的 external id，不是本机的 calendarItemIdentifier
+        assert created.description == "SOURCE: apple\nUID: reminder:e1"
+        assert state.links["a1"]["zectrixId"] == created.todo_id
+
+    def test_new_todo_creates_reminder_and_writes_back_uid(self, state):
+        todo = ZTodo(1, task("买菜"), "", 100)
+        zectrix, apple, engine = build(state, z_todos=[todo])
+        engine.run([todo])
+
+        assert len(apple.items) == 1
+        rem = next(iter(apple.items.values()))
+        assert rem.task == task("买菜")
+        # Apple 锚点要回写到 Zectrix 备注，状态文件丢了 / 换台电脑都能认回来
+        assert zectrix.todos[1].description == f"SOURCE: apple\nUID: reminder:{rem.ext_id}"
+
+    def test_calendar_prefixed_todo_never_goes_to_apple(self, state):
+        todo = ZTodo(1, task(f"{sc.CALENDAR_PREFIX} 周会"), "SOURCE: caldav\nUID: x", 100)
+        zectrix, apple, engine = build(state, z_todos=[todo])
+        engine.run([todo])
+        assert apple.items == {}
+
+    def test_out_of_window_is_not_created(self, state):
+        rem = ARem("a1", "e1", task("明天的事", date=TOMORROW), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        assert zectrix.todos == {}
+
+    def test_completed_new_item_skipped_by_default(self, state):
+        rem = ARem("a1", "e1", task(completed=True), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        assert zectrix.todos == {}
+
+    def test_completed_new_item_synced_when_enabled(self, state, monkeypatch):
+        monkeypatch.setattr(sc, "SYNC_NEW_COMPLETED", True)
+        rem = ARem("a1", "e1", task(completed=True), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        assert len(zectrix.todos) == 1
+        assert next(iter(zectrix.todos.values())).task.completed
+
+    def test_no_duplicate_on_second_run(self, state):
+        rem = ARem("a1", "e1", task("买牛奶"), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        assert len(zectrix.todos) == 1
+
+        # 第二次运行：内容没变，什么都不该发生
+        zectrix2 = FakeZectrix(list(zectrix.todos.values()))
+        engine2 = ReminderSync(zectrix2, apple, state)
+        engine2.run(list(zectrix2.todos.values()))
+        assert len(zectrix2.todos) == 1
+        assert zectrix2.calls == []
+        assert apple.calls == []
+
+
+# --------------------------------------------------------------------------
+# 完成状态（划掉）双向传播
+# --------------------------------------------------------------------------
+
+class TestCompletion:
+    def _linked(self, state, snapshot=None):
+        snapshot = snapshot or task()
+        state.link("a1", "e1", 1, snapshot)
+        return snapshot
+
+    def test_completed_in_apple_crosses_off_zectrix(self, state):
+        snap = self._linked(state)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task(completed=True), 200, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert zectrix.todos[1].task.completed is True
+        assert ("set_completed", 1, True) in zectrix.calls
+        assert state.links["a1"]["snapshot"]["completed"] is True
+
+    def test_completed_in_zectrix_crosses_off_apple(self, state):
+        snap = self._linked(state)
+        todo = ZTodo(1, task(completed=True), "SOURCE: apple\nUID: reminder:a1", 200)
+        rem = ARem("a1", "e1", snap, 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert apple.items["a1"].task.completed is True
+        assert apple.kinds() == ["update"]
+
+    def test_uncomplete_propagates_from_apple(self, state):
+        snap = self._linked(state, task(completed=True))
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task(completed=False), 200, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert zectrix.todos[1].task.completed is False
+        assert ("set_completed", 1, False) in zectrix.calls
+
+    def test_uncomplete_propagates_from_zectrix(self, state):
+        snap = self._linked(state, task(completed=True))
+        todo = ZTodo(1, task(completed=False), "SOURCE: apple\nUID: reminder:a1", 200)
+        rem = ARem("a1", "e1", snap, 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        assert apple.items["a1"].task.completed is False
+
+    def test_completion_survives_out_of_window(self, state, monkeypatch):
+        """已配对的任务即使超出同步窗口，划掉也要继续同步。"""
+        old = task("昨天的事", date=YESTERDAY)
+        state.link("a1", "e1", 1, old)
+        todo = ZTodo(1, old, "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", Task("昨天的事", YESTERDAY, "10:00", True), 200, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        assert zectrix.todos[1].task.completed is True
+
+
+# --------------------------------------------------------------------------
+# 内容修改与冲突
+# --------------------------------------------------------------------------
+
+class TestUpdateAndConflict:
+    def test_title_change_in_apple(self, state):
+        snap = task("旧标题")
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task("新标题"), 200, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        assert zectrix.todos[1].task.title == "新标题"
+
+    def test_time_change_in_zectrix(self, state):
+        snap = task(time="10:00")
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, task(time="15:30"), "SOURCE: apple\nUID: reminder:a1", 200)
+        rem = ARem("a1", "e1", snap, 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        assert apple.items["a1"].task.due_time == "15:30"
+
+    def test_conflict_newer_apple_wins(self, state):
+        snap = task("原始")
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, task("墨水屏改的"), "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task("提醒事项改的"), 999, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert zectrix.todos[1].task.title == "提醒事项改的"
+        assert engine.stats["conflicts"] == 1
+
+    def test_conflict_newer_zectrix_wins(self, state):
+        snap = task("原始")
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, task("墨水屏改的"), "SOURCE: apple\nUID: reminder:a1", 999)
+        rem = ARem("a1", "e1", task("提醒事项改的"), 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert apple.items["a1"].task.title == "墨水屏改的"
+        assert engine.stats["conflicts"] == 1
+
+    def test_both_sides_changed_identically_is_not_a_conflict(self, state):
+        state.link("a1", "e1", 1, task("原始"))
+        todo = ZTodo(1, task("一样的新标题"), "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task("一样的新标题"), 200, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert zectrix.calls == []
+        assert apple.calls == []
+        assert engine.stats["conflicts"] == 0
+        assert state.links["a1"]["snapshot"]["title"] == "一样的新标题"
+
+    def test_no_change_does_nothing(self, state):
+        snap = task()
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", snap, 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        assert zectrix.calls == []
+        assert apple.calls == []
+
+
+# --------------------------------------------------------------------------
+# 删除策略
+# --------------------------------------------------------------------------
+
+class TestDeletion:
+    def test_apple_deleted_removes_zectrix_todo(self, state):
+        snap = task()
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        zectrix, apple, engine = build(state, [todo], [])   # Apple 里没有了
+        engine.run([todo])
+
+        assert zectrix.todos == {}
+        assert "a1" not in state.links
+        # 回归：刚删掉的待办不能在「新建」阶段又被推回提醒事项
+        assert apple.calls == []
+        assert zectrix.kinds() == ["delete"]
+
+    def test_zectrix_deleted_keeps_reminder_by_default(self, state):
+        snap = task()
+        state.link("a1", "e1", 1, snap)
+        rem = ARem("a1", "e1", snap, 100, "提醒事项")
+        zectrix, apple, engine = build(state, [], [rem])    # Zectrix 里没有了
+        engine.run([])
+
+        assert "a1" in apple.items          # 提醒事项保留
+        assert "a1" not in state.links
+        assert "a1" in state.tomb_apple     # 打墓碑，下次不会又建回去
+
+    def test_tombstone_prevents_resurrection(self, state):
+        state.link("a1", "e1", 1, task())
+        rem = ARem("a1", "e1", task(), 100, "提醒事项")
+        zectrix, apple, engine = build(state, [], [rem])
+        engine.run([])
+
+        zectrix2, _, engine2 = build(state, [], [rem])
+        engine2.run([])
+        assert zectrix2.todos == {}
+
+    def test_mirror_policy_deletes_reminder(self, state, monkeypatch):
+        monkeypatch.setattr(sc, "DELETE_POLICY", "mirror")
+        state.link("a1", "e1", 1, task())
+        rem = ARem("a1", "e1", task(), 100, "提醒事项")
+        zectrix, apple, engine = build(state, [], [rem])
+        engine.run([])
+
+        assert apple.items == {}
+        assert "a1" not in state.links
+        # 回归：刚删掉的提醒不能在「新建」阶段又被推回墨水屏
+        assert zectrix.calls == []
+        assert apple.kinds() == ["delete"]
+
+    def test_none_policy_deletes_nothing(self, state, monkeypatch):
+        monkeypatch.setattr(sc, "DELETE_POLICY", "none")
+        snap = task()
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        zectrix, apple, engine = build(state, [todo], [])
+        engine.run([todo])
+
+        assert zectrix.todos == {1: todo}
+        assert "1" in state.tomb_zectrix
+
+    def test_both_gone_just_drops_link(self, state):
+        state.link("a1", "e1", 1, task())
+        zectrix, apple, engine = build(state, [], [])
+        engine.run([])
+        assert state.links == {}
+        assert state.tomb_apple == {}
+
+
+# --------------------------------------------------------------------------
+# 第二台 Mac
+# --------------------------------------------------------------------------
+
+class TestSecondMac:
+    """同一条 iCloud 提醒，在另一台 Mac 上 calendarItemIdentifier 是不一样的。
+
+    第二台机器的状态文件是空的，只能靠 Zectrix 备注里的 external id 认回配对，
+    否则就会把每条任务在两边都建一份重复的。
+    """
+
+    def _mac_b(self, state_b, z_todos, reminders):
+        """B 机器：同样的提醒，但本地 id 全变了，external id 不变。"""
+        relocated = [ARem(f"B-{r.apple_id}", r.ext_id, r.task, r.updated_at, r.list_name)
+                     for r in reminders]
+        return build(state_b, z_todos, relocated)
+
+    def test_second_mac_adopts_instead_of_duplicating(self, state, tmp_path):
+        # A 机器：从提醒事项建出墨水屏待办
+        rem = ARem("A-1", "icloud-uid-1", task("买牛奶"), 100, "提醒事项")
+        zectrix_a, apple_a, engine_a = build(state, reminders=[rem])
+        engine_a.run([])
+        assert len(zectrix_a.todos) == 1
+
+        # B 机器：全新状态文件，看到同样的数据
+        state_b = SyncState(str(tmp_path / "mac_b.json"))
+        z_todos = list(zectrix_a.todos.values())
+        zectrix_b, apple_b, engine_b = self._mac_b(state_b, z_todos, [rem])
+        engine_b.run(z_todos)
+
+        assert len(zectrix_b.todos) == 1, "B 机器不该再建一条墨水屏待办"
+        assert len(apple_b.items) == 1, "B 机器不该再建一条提醒事项"
+        assert state_b.links["B-A-1"]["zectrixId"] == z_todos[0].todo_id
+        assert zectrix_b.calls == []
+        assert apple_b.calls == []
+
+    def test_second_mac_propagates_completion(self, state, tmp_path):
+        rem = ARem("A-1", "icloud-uid-1", task("买牛奶"), 100, "提醒事项")
+        zectrix_a, apple_a, engine_a = build(state, reminders=[rem])
+        engine_a.run([])
+
+        # 在 B 机器上把这条提醒勾掉
+        done = ARem("B-A-1", "icloud-uid-1", task("买牛奶", completed=True), 500, "提醒事项")
+        state_b = SyncState(str(tmp_path / "mac_b.json"))
+        z_todos = list(zectrix_a.todos.values())
+        zectrix_b, apple_b, engine_b = build(state_b, z_todos, [done])
+        engine_b.run(z_todos)
+
+        todo = next(iter(zectrix_b.todos.values()))
+        assert todo.task.completed is True
+
+    def test_old_local_id_anchor_still_resolves(self, state, tmp_path):
+        """老版本备注里写的是本地 id，升级后不能突然认不出来。"""
+        rem = ARem("a1", "e1", task("旧数据"), 100, "提醒事项")
+        todo = ZTodo(7, task("旧数据"), "SOURCE: apple\nUID: reminder:a1", 100)
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert state.links["a1"]["zectrixId"] == 7
+        assert len(zectrix.todos) == 1
+        assert len(apple.items) == 1
+
+
+# --------------------------------------------------------------------------
+# 收敛性：跑第二遍必须是空操作
+# --------------------------------------------------------------------------
+
+class TestConvergence:
+    """每个场景都跑两遍，第二遍不能再产生任何读写 —— 否则就是来回打架的死循环。"""
+
+    def _second_run_is_noop(self, state, zectrix, apple):
+        z2 = FakeZectrix(list(zectrix.todos.values()))
+        a2 = FakeApple(list(apple.items.values()))
+        ReminderSync(z2, a2, state).run(list(z2.todos.values()))
+        assert z2.calls == [], f"第二遍还在写 Zectrix: {z2.calls}"
+        assert a2.calls == [], f"第二遍还在写 Apple: {a2.calls}"
+
+    def test_after_creating_from_apple(self, state):
+        rem = ARem("a1", "e1", task("买牛奶"), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        self._second_run_is_noop(state, zectrix, apple)
+
+    def test_after_creating_from_zectrix(self, state):
+        todo = ZTodo(1, task("买菜"), "", 100)
+        zectrix, apple, engine = build(state, z_todos=[todo])
+        engine.run([todo])
+        self._second_run_is_noop(state, zectrix, apple)
+
+    def test_after_completion_propagates(self, state):
+        snap = task()
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task(completed=True), 200, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        self._second_run_is_noop(state, zectrix, apple)
+
+    def test_after_conflict_resolution(self, state):
+        state.link("a1", "e1", 1, task("原始"))
+        todo = ZTodo(1, task("墨水屏改的"), "SOURCE: apple\nUID: reminder:a1", 100)
+        rem = ARem("a1", "e1", task("提醒事项改的"), 999, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+        self._second_run_is_noop(state, zectrix, apple)
+
+    def test_after_apple_deletion(self, state):
+        snap = task()
+        state.link("a1", "e1", 1, snap)
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
+        zectrix, apple, engine = build(state, [todo], [])
+        engine.run([todo])
+        self._second_run_is_noop(state, zectrix, apple)
+
+    def test_after_zectrix_deletion(self, state):
+        state.link("a1", "e1", 1, task())
+        rem = ARem("a1", "e1", task(), 100, "提醒事项")
+        zectrix, apple, engine = build(state, [], [rem])
+        engine.run([])
+        self._second_run_is_noop(state, zectrix, apple)
+
+
+# --------------------------------------------------------------------------
+# 状态文件与迁移
+# --------------------------------------------------------------------------
+
+class TestState:
+    def test_save_and_reload(self, tmp_path):
+        path = str(tmp_path / "s.json")
+        s = SyncState(path)
+        s.link("a1", "e1", 42, task("持久化"))
+        s.save(dry_run=False)
+
+        again = SyncState(path)
+        assert again.links["a1"]["zectrixId"] == 42
+        assert Task.from_dict(again.links["a1"]["snapshot"]) == task("持久化")
+
+    def test_dry_run_never_writes(self, tmp_path):
+        path = str(tmp_path / "s.json")
+        s = SyncState(path)
+        s.link("a1", "e1", 42, task())
+        s.save(dry_run=True)
+        assert not os.path.exists(path)
+
+    def test_version_mismatch_is_ignored(self, tmp_path):
+        path = tmp_path / "s.json"
+        path.write_text(json.dumps({"version": 1, "links": {"a1": {}}}), encoding="utf-8")
+        assert SyncState(str(path)).links == {}
+
+    def test_corrupt_file_is_ignored(self, tmp_path):
+        path = tmp_path / "s.json"
+        path.write_text("{ not json", encoding="utf-8")
+        assert SyncState(str(path)).links == {}
+
+    def test_tombstones_expire(self, state, monkeypatch):
+        monkeypatch.setattr(sc, "TOMBSTONE_DAYS", 30)
+        old = (datetime.datetime.now() - datetime.timedelta(days=99)).isoformat(timespec="seconds")
+        state.tomb_apple["stale"] = old
+        state.tomb_apple["fresh"] = datetime.datetime.now().isoformat(timespec="seconds")
+        state.prune_tombstones()
+        assert "stale" not in state.tomb_apple
+        assert "fresh" in state.tomb_apple
+
+    def test_migration_recovers_link_from_description(self, state):
+        """状态文件丢失后，靠 Zectrix 备注里的 UID 重新配对，而不是重复创建。"""
+        rem = ARem("a1", "e1", task("已存在"), 100, "提醒事项")
+        todo = ZTodo(7, task("已存在"), "SOURCE: apple\nUID: reminder:a1", 100)
+        zectrix, apple, engine = build(state, [todo], [rem])
+        engine.run([todo])
+
+        assert state.links["a1"]["zectrixId"] == 7
+        assert len(zectrix.todos) == 1
+        assert len(apple.items) == 1
+
+
+# --------------------------------------------------------------------------
+# dry-run
+# --------------------------------------------------------------------------
 
 class TestDryRun:
-    """测试 dry-run 模式：写操作被拦截，返回True"""
+    def test_dry_run_writes_nothing(self, state):
+        rem = ARem("a1", "e1", task("新提醒"), 100, "提醒事项")
+        todo = ZTodo(1, task("新待办"), "", 100)
+        zectrix, apple, engine = build(state, [todo], [rem], dry_run=True)
+        engine.run([todo])
 
-    def setup_method(self):
-        self.syncer = CalendarSyncer(dry_run=True)
-
-    def test_complete_todo_dry_run(self, capsys):
-        """dry-run模式下complete_todo不调用API"""
-        result = self.syncer.complete_todo(123)
-        assert result is True
-        captured = capsys.readouterr()
-        assert "[DRY RUN]" in captured.out
-        assert "123" in captured.out
-
-    def test_delete_todo_dry_run(self, capsys):
-        """dry-run模式下delete_todo不调用API"""
-        result = self.syncer.delete_todo(456)
-        assert result is True
-        captured = capsys.readouterr()
-        assert "[DRY RUN]" in captured.out
-        assert "456" in captured.out
-
-    def test_create_todo_dry_run(self, capsys):
-        """dry-run模式下create_todo不调用API"""
-        result = self.syncer.create_todo("uid1", "测试会议", "2024-03-27", "10:00")
-        assert result is True
-        captured = capsys.readouterr()
-        assert "[DRY RUN]" in captured.out
-        assert "测试会议" in captured.out
-
-    def test_update_todo_dry_run(self, capsys):
-        """dry-run模式下update_todo不调用API"""
-        result = self.syncer.update_todo(789, "uid1", "新标题", "2024-03-27", "14:00")
-        assert result is True
-        captured = capsys.readouterr()
-        assert "[DRY RUN]" in captured.out
-        assert "789" in captured.out
-        assert "新标题" in captured.out
-
-    def test_dry_run_full_sync_flow(self, mocker, capsys):
-        """dry-run模式下完整同步流程不执行任何写入"""
-        self.syncer.existing_todos = []
-        self.syncer._uid_map = {}
-
-        events = [
-            {"uid": "uid-new", "title": "新会议", "dueDate": "2024-03-27", "dueTime": "10:00"},
-        ]
-
-        # 不mock任何requests方法，如果dry_run没生效会真的调API从而失败
-        self.syncer.sync_new_events(events)
-
-        captured = capsys.readouterr()
-        assert "[DRY RUN]" in captured.out
-
-    def test_normal_mode_actually_calls_api(self, mocker):
-        """非dry-run模式正常调用API（确保guard不影响正常流程）"""
-        syncer = CalendarSyncer(dry_run=False)
-        mock_response = Mock()
-        mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {"code": 0}
-        mock_put = mocker.patch('requests.put', return_value=mock_response)
-
-        def _mock_retry(func, *args, **kwargs):
-            return func()
-
-        with patch.object(syncer, 'retry_with_backoff', side_effect=_mock_retry):
-            result = syncer.complete_todo(123)
-
-        assert result is True
-        mock_put.assert_called_once()
+        assert len(zectrix.todos) == 1          # 只有原来那条
+        assert len(apple.items) == 1            # 只有原来那条
+        assert state.links == {}                # dry-run 不建立配对
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+# --------------------------------------------------------------------------
+# 日历事件解析（保留原有单向逻辑）
+# --------------------------------------------------------------------------
+
+class TestCalendarParsing:
+    def _ics(self, summary, dtstart, uid="uid-1"):
+        class Item:
+            data = (
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+                f"UID:{uid}\r\nSUMMARY:{summary}\r\nDTSTART:{dtstart}\r\n"
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+        return Item()
+
+    def test_parses_event_in_range(self):
+        now = datetime.datetime.now().astimezone()
+        soon = now + datetime.timedelta(hours=1)
+        end = now + datetime.timedelta(days=1)
+        out = sc.CalendarSync._parse(
+            self._ics("周会", soon.strftime("%Y%m%dT%H%M%S")), now, end)
+        assert len(out) == 1
+        assert out[0]["title"] == "周会"
+        assert out[0]["dueTime"] == soon.strftime("%H:%M")
+
+    @pytest.mark.parametrize("summary", ["已取消 周会", "Cancelled standup", "CANCELED sync"])
+    def test_skips_cancelled(self, summary):
+        now = datetime.datetime.now().astimezone()
+        soon = now + datetime.timedelta(hours=1)
+        out = sc.CalendarSync._parse(
+            self._ics(summary, soon.strftime("%Y%m%dT%H%M%S")),
+            now, now + datetime.timedelta(days=1))
+        assert out == []
+
+    def test_keeps_event_that_already_started(self):
+        """回归：会议开始后不能从结果里消失。
+
+        之前起点取的是「现在」，已开始的会议落在窗口外 -> 匹配不上现有待办
+        -> 被当成「日历里删了」删掉。表现就是会议一开始就从墨水屏上消失，
+        而且 EXPIRE_HOURS 的自动划掉永远轮不到执行。
+        """
+        start, end = sc.CalendarSync.event_window()
+        start, end = start.astimezone(), end.astimezone()
+        began = datetime.datetime.now().astimezone() - datetime.timedelta(hours=2)
+        out = sc.CalendarSync._parse(
+            self._ics("两小时前开始的会", began.strftime("%Y%m%dT%H%M%S")), start, end)
+        assert len(out) == 1
+        assert out[0]["title"] == "两小时前开始的会"
+
+    def test_skips_event_outside_the_window(self):
+        start, end = sc.CalendarSync.event_window()
+        start, end = start.astimezone(), end.astimezone()
+        long_ago = start - datetime.timedelta(days=3)
+        out = sc.CalendarSync._parse(
+            self._ics("上周的会", long_ago.strftime("%Y%m%dT%H%M%S")), start, end)
+        assert out == []
+
+    def test_window_starts_at_midnight_not_now(self):
+        start, end = sc.CalendarSync.event_window()
+        assert (start.hour, start.minute, start.second) == (0, 0, 0)
+        assert start.date() == datetime.date.today()
+        assert end.date() == datetime.date.today() + datetime.timedelta(days=1)
+
+    def test_recurring_instances_on_different_days_get_distinct_keys(self):
+        """重复日程每次展开 UID 相同，靠日期后缀区分，否则一个系列只剩一条。"""
+        now = datetime.datetime.now().astimezone()
+        end = now + datetime.timedelta(days=7)
+        out = []
+        for days in (1, 2, 3):
+            when = now + datetime.timedelta(days=days)
+            out += sc.CalendarSync._parse(
+                self._ics("站会", when.strftime("%Y%m%dT%H%M%S"), uid="weekly-1"),
+                now, end)
+        assert len({e["uid"] for e in out}) == 3
+        assert all(e["uid"].startswith("weekly-1@") for e in out)
+
+    def test_key_survives_a_time_change(self):
+        """后缀只到日期不到分钟：会议改时间要走「更新」，不能变成删了重建。"""
+        now = datetime.datetime.now().astimezone()
+        end = now + datetime.timedelta(days=2)
+        base = (now + datetime.timedelta(days=1)).replace(hour=10, minute=0, second=0)
+        moved = base.replace(hour=14)
+        a = sc.CalendarSync._parse(
+            self._ics("组会", base.strftime("%Y%m%dT%H%M%S"), uid="evt-1"), now, end)
+        b = sc.CalendarSync._parse(
+            self._ics("组会", moved.strftime("%Y%m%dT%H%M%S"), uid="evt-1"), now, end)
+        assert a[0]["uid"] == b[0]["uid"]
+        assert a[0]["dueTime"] != b[0]["dueTime"]
+
+
+class TestCalendarSources:
+    """CALENDAR_SOURCE 的取事件 + 去重逻辑。"""
+
+    def _syncer(self, monkeypatch, source, eventkit=None, caldav=None):
+        monkeypatch.setattr(sc, "CALENDAR_SOURCE", source)
+        monkeypatch.setattr(sc, "CALDAV_PASS", "x" if caldav is not None else "")
+        syncer = sc.CalendarSync(FakeZectrix())
+
+        def fake_ek():
+            if isinstance(eventkit, Exception):
+                raise eventkit
+            return eventkit or []
+
+        monkeypatch.setattr(syncer, "_fetch_from_eventkit", fake_ek)
+        monkeypatch.setattr(syncer, "_fetch_from_caldav", lambda: caldav)
+        return syncer
+
+    def _event(self, uid, title):
+        return {"uid": uid, "title": title, "dueDate": TODAY, "dueTime": "10:00"}
+
+    def test_both_sources_dedup_by_uid(self, monkeypatch):
+        """同一条 iCloud 事件两边都能拿到，墨水屏上不能出现两次。"""
+        shared = self._event("icloud-1@" + TODAY, "组会")
+        only_google = self._event("google-1@" + TODAY, "UMD 课")
+        syncer = self._syncer(monkeypatch, "both",
+                              eventkit=[shared, only_google], caldav=[shared])
+        events = syncer._collect_events()
+        assert len(events) == 2
+        assert {e["uid"] for e in events} == {shared["uid"], only_google["uid"]}
+
+    def test_eventkit_only_skips_caldav(self, monkeypatch):
+        syncer = self._syncer(monkeypatch, "eventkit",
+                              eventkit=[self._event("a@" + TODAY, "会")],
+                              caldav=[self._event("b@" + TODAY, "不该出现")])
+        events = syncer._collect_events()
+        assert [e["title"] for e in events] == ["会"]
+
+    def test_one_source_failing_still_returns_the_other(self, monkeypatch):
+        syncer = self._syncer(monkeypatch, "both",
+                              eventkit=sc.AppleRemindersError("没权限"),
+                              caldav=[self._event("b@" + TODAY, "CalDAV 的会")])
+        events = syncer._collect_events()
+        assert [e["title"] for e in events] == ["CalDAV 的会"]
+
+    def test_all_sources_failing_returns_none(self, monkeypatch):
+        """全挂了要返回 None —— 让上层跳过删除，别把日程全清了。"""
+        syncer = self._syncer(monkeypatch, "both",
+                              eventkit=sc.AppleRemindersError("没权限"), caldav=None)
+        assert syncer._collect_events() is None
+
+    def test_missing_pyobjc_is_not_fatal(self, monkeypatch):
+        syncer = self._syncer(monkeypatch, "both",
+                              eventkit=ImportError("no pyobjc"),
+                              caldav=[self._event("b@" + TODAY, "会")])
+        assert len(syncer._collect_events()) == 1
+
+
+class TestCalendarSyncMatching:
+    def _todo(self, todo_id, uid, title="[日历] 组会", time="10:00"):
+        return ZTodo(todo_id, Task(title, TODAY, time, False),
+                     f"SOURCE: calendar\nUID: {uid}", 100)
+
+    def test_bare_uid_from_old_version_still_matches(self):
+        """升级后 UID 格式变了，老日程不能被删掉重建。"""
+        old = self._todo(1, "evt-1")
+        zectrix = FakeZectrix([old])
+        syncer = sc.CalendarSync(zectrix)
+        syncer._sync([{"uid": f"evt-1@{TODAY}", "title": "组会",
+                       "dueDate": TODAY, "dueTime": "10:00"}], [old])
+
+        assert "delete" not in zectrix.kinds()
+        assert "create" not in zectrix.kinds()
+        assert zectrix.kinds() == ["update"]   # 只把备注升级成新格式
+
+    def test_started_meeting_is_not_deleted_end_to_end(self):
+        """整条链路的回归：日程还在日历里（只是已经开始），就不能被删。"""
+        began = datetime.datetime.now() - datetime.timedelta(hours=2)
+        uid = f"evt-1@{began:%Y-%m-%d}"
+        todo = ZTodo(1, Task("[日历] 组会", f"{began:%Y-%m-%d}", f"{began:%H:%M}", False),
+                     f"SOURCE: calendar\nUID: {uid}", 100)
+        zectrix = FakeZectrix([todo])
+        sc.CalendarSync(zectrix)._sync(
+            [{"uid": uid, "title": "组会",
+              "dueDate": f"{began:%Y-%m-%d}", "dueTime": f"{began:%H:%M}"}], [todo])
+
+        assert "delete" not in zectrix.kinds()
+        assert zectrix.todos[1].task.completed is False   # 由 _complete_expired 负责划掉
+
+    def test_vanished_event_is_deleted(self):
+        gone = self._todo(1, f"evt-1@{TODAY}")
+        zectrix = FakeZectrix([gone])
+        syncer = sc.CalendarSync(zectrix)
+        syncer._sync([], [gone])
+        assert zectrix.kinds() == ["delete"]
+
+    def test_completed_calendar_todo_is_not_deleted(self):
+        """已经划掉的过期日程不该再被删一次。"""
+        done = ZTodo(1, Task("[日历] 组会", TODAY, "10:00", True),
+                     f"SOURCE: calendar\nUID: evt-1@{TODAY}", 100)
+        zectrix = FakeZectrix([done])
+        sc.CalendarSync(zectrix)._sync([], [done])
+        assert zectrix.calls == []
+
+    def test_time_change_updates(self):
+        todo = self._todo(1, f"evt-1@{TODAY}", time="10:00")
+        zectrix = FakeZectrix([todo])
+        sc.CalendarSync(zectrix)._sync(
+            [{"uid": f"evt-1@{TODAY}", "title": "组会",
+              "dueDate": TODAY, "dueTime": "14:00"}], [todo])
+        assert zectrix.todos[1].task.due_time == "14:00"
+
+
+class TestCalendarParsingMore:
+    def test_uid_extraction(self):
+        assert ReminderSync._uid_from_description("SOURCE: apple\nUID: reminder:abc") \
+            == "reminder:abc"
+        assert ReminderSync._uid_from_description("  UID:   x  ") == "x"
+        assert ReminderSync._uid_from_description("") == ""
+        assert ReminderSync._uid_from_description("没有 uid") == ""
