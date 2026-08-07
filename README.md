@@ -3,7 +3,10 @@
 把 [极趣 Zectrix](https://cloud.zectrix.com/) 墨水屏电子便利贴和 macOS 的「提醒事项」双向同步：
 在哪边勾掉、改标题、改时间、删掉，另一边都会跟上。
 
-https://space.bilibili.com/13131424
+> 本项目基于 [defia/zectrix_calendar_sync](https://github.com/defia/zectrix_calendar_sync)
+> 二次开发（MIT）。原版是 CalDAV 日历 → 墨水屏的单向同步，
+> 这个分支把它扩展成了 Apple 提醒事项 ⇄ 墨水屏的双向同步。
+> 原作者：[defia](https://space.bilibili.com/13131424)
 
 ## 功能
 
