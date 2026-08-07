@@ -1,5 +1,22 @@
 *.txt
+# 换电脑要靠它装依赖，别被上面那行吃掉
+!requirements.txt
+
 *.pyc
 __pycache__/
+.pytest_cache/
+.DS_Store
+
+# 密钥：API Key、CalDAV 密码
 .env
 .env.*
+# 这个是空模板，要提交
+!.env.example
+
+# 配对状态，每台机器自己生成 —— 拷到别的电脑反而会出问题
+.sync_state.json
+.sync_state.json.tmp
+
+# 桌面按钮，用 ./make_app.sh 生成
+Zectrix 同步.app/
+*.iconset/

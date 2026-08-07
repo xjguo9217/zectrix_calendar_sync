@@ -1,0 +1,19 @@
+# Zectrix 墨水屏 <-> Apple 提醒事项 同步
+#
+#   pip install -r requirements.txt
+#
+# 版本是我这台跑通时的版本，装新一点的一般也没问题。
+
+requests>=2.31
+python-dotenv>=1.0
+
+# CalDAV 来源（CALENDAR_SOURCE=caldav / both 时用）
+caldav>=2.0
+icalendar>=6.0
+
+# Apple 提醒事项 + macOS 日历。只有 macOS 装得上；
+# 别的系统上 pip 会跳过这一行，脚本会自动退化成只跑 CalDAV。
+pyobjc-framework-EventKit>=10.0 ; sys_platform == "darwin"
+
+# 跑测试用，日常同步不需要
+pytest>=8.0
