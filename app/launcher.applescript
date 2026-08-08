@@ -19,11 +19,12 @@ on run
 
 	display notification "正在同步…" with title "Zectrix 同步"
 
+	-- run.sh 自己会写日志，这里不要再重定向一遍，否则每次都记两份。
 	-- 末尾的 echo 保证整条命令永远退出 0，这样 do shell script 不会抛异常，
 	-- 我们自己解析真实退出码。
 	set shellCmd to "cd " & quoted form of projectDir & " && " & ¬
-		"{ date '+=== %Y-%m-%d %H:%M:%S ==='; ./run.sh; echo \"EXITCODE:$?\"; } >> " & ¬
-		quoted form of logFile & " 2>&1; tail -n 400 " & quoted form of logFile
+		"./run.sh >/dev/null 2>&1; echo \"EXITCODE:$?\"; tail -n 400 " & ¬
+		quoted form of logFile
 
 	set logTail to do shell script shellCmd
 

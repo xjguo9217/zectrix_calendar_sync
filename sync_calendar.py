@@ -559,6 +559,21 @@ def request_eventkit_access(store, entity: str) -> None:
             f"      设置直达: x-apple.systempreferences:com.apple.preference.security?{pane}"
         )
 
+    # granted=True 还不够：macOS 14+ 分「完全访问」和「仅添加」两档。
+    # 仅添加时列表名读得到、内容却一律为空 —— 看起来就像「你一条提醒都没有」，
+    # 极难分辨。把真实档位打出来。
+    try:
+        status = type(store).authorizationStatusForEntityType_(
+            EKEntityTypeReminder if is_reminders else EKEntityTypeEvent)
+        names = {0: "未决定", 1: "受限", 2: "已拒绝", 3: "完全访问", 4: "仅添加"}
+        if status != 3:
+            log(f"  ⚠️  {label}权限档位是「{names.get(status, status)}」，不是「完全访问」。"
+                f"「仅添加」只能写不能读，同步会一直显示 0 条。")
+            log(f"      去「系统设置 → 隐私与安全性 → {label}」把 {responsible_app()} "
+                "改成完全访问。")
+    except Exception:
+        pass
+
     store.refreshSourcesIfNecessary()
 
 
