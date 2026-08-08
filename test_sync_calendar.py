@@ -144,6 +144,7 @@ def default_policy(monkeypatch):
     monkeypatch.setattr(sc, "SYNC_DAYS_BACK", 0)
     monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", 0)
     monkeypatch.setattr(sc, "SYNC_NEW_COMPLETED", False)
+    monkeypatch.setattr(sc, "CALENDAR_HOURS_AHEAD", 0)
 
 
 # --------------------------------------------------------------------------
@@ -184,6 +185,71 @@ class TestWindow:
 
     def test_bad_date(self):
         assert not ReminderSync.in_window("")
+
+    def test_unlimited_accepts_any_future_date(self, monkeypatch):
+        """SYNC_DAYS_AHEAD=all：将来的待办全要。"""
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", None)
+        far = (datetime.date.today() + datetime.timedelta(days=400)).strftime("%Y-%m-%d")
+        assert ReminderSync.in_window(TOMORROW)
+        assert ReminderSync.in_window(far)
+
+    def test_unlimited_still_rejects_the_past(self, monkeypatch):
+        """不限只对将来生效，过去的仍然按 SYNC_DAYS_BACK 卡。"""
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", None)
+        monkeypatch.setattr(sc, "SYNC_DAYS_BACK", 0)
+        assert not ReminderSync.in_window(YESTERDAY)
+        assert ReminderSync.in_window(TODAY)
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("all", None), ("ALL", None), ("unlimited", None), ("-1", None),
+        ("0", 0), ("3", 3), ("垃圾", 0), ("", 0), ("-5", None),
+    ])
+    def test_parse_days_ahead(self, raw, expected, monkeypatch):
+        monkeypatch.setenv("SYNC_DAYS_AHEAD", raw)
+        assert sc._env_days_ahead() == expected
+
+    def test_window_text_says_unlimited(self, monkeypatch):
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", None)
+        assert "不限" in ReminderSync.window_text()
+
+
+class TestCalendarWindow:
+    """日历有独立的按小时窗口，和提醒事项互不影响。"""
+
+    def test_hours_ahead_overrides_days(self, monkeypatch):
+        monkeypatch.setattr(sc, "CALENDAR_HOURS_AHEAD", 24)
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", None)
+        start, end = sc.CalendarSync.event_window()
+        now = datetime.datetime.now()
+        # 终点是「现在 + 24 小时」滚动，不是整天边界
+        assert abs((end - (now + datetime.timedelta(hours=24))).total_seconds()) < 5
+        # 起点仍是今天 00:00（已开始的会议要留着，见 event_window 的说明）
+        assert (start.hour, start.minute) == (0, 0)
+        assert start.date() == datetime.date.today()
+
+    def test_unlimited_reminders_do_not_make_calendar_unlimited(self, monkeypatch, capsys):
+        """提醒可以不限，日历不行 —— 否则几个月的会全灌上墨水屏。"""
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", None)
+        monkeypatch.setattr(sc, "CALENDAR_HOURS_AHEAD", 0)
+        start, end = sc.CalendarSync.event_window()
+        assert (end - start).days <= 1
+        assert "日历不能不限" in capsys.readouterr().out
+
+    def test_falls_back_to_days_when_hours_not_set(self, monkeypatch):
+        monkeypatch.setattr(sc, "CALENDAR_HOURS_AHEAD", 0)
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", 2)
+        start, end = sc.CalendarSync.event_window()
+        assert end.date() == datetime.date.today() + datetime.timedelta(days=3)
+        assert (end.hour, end.minute) == (0, 0)
+
+    def test_the_two_windows_are_independent(self, monkeypatch):
+        """用户要的配置：待办将来所有，日历只未来 24 小时。"""
+        monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", None)
+        monkeypatch.setattr(sc, "CALENDAR_HOURS_AHEAD", 24)
+        far = (datetime.date.today() + datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+        assert ReminderSync.in_window(far)                      # 90 天后的待办：要
+        _, end = sc.CalendarSync.event_window()
+        assert end < datetime.datetime.now() + datetime.timedelta(hours=25)  # 日历：只 24 小时
 
 
 # --------------------------------------------------------------------------

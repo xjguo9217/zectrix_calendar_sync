@@ -86,7 +86,25 @@ EXPIRE_HOURS = _env_int("EXPIRE_HOURS", 1)   # [日历] 日程过期多久后划
 # 双向同步范围
 STATE_FILE = _env("SYNC_STATE_FILE", os.path.join(SCRIPT_DIR, ".sync_state.json"))
 SYNC_DAYS_BACK = _env_int("SYNC_DAYS_BACK", 0)          # 往前几天的任务也纳入
-SYNC_DAYS_AHEAD = _env_int("SYNC_DAYS_AHEAD", 0)        # 往后几天的任务也纳入
+
+
+def _env_days_ahead() -> Optional[int]:
+    """提醒事项往后看几天。`all` / `-1` = 不限，把将来所有待办都同步过去。"""
+    raw = _env("SYNC_DAYS_AHEAD", "0").lower()
+    if raw in ("all", "unlimited"):
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    # 任何负数都当「不限」。只认 -1、让 -5 悄悄变成 0 会很莫名其妙。
+    return None if value < 0 else value
+
+
+SYNC_DAYS_AHEAD = _env_days_ahead()      # None = 不限
+# 日历单独一个开关：会议按小时算比按天自然（「未来 24 小时」而不是「今天+明天」）。
+# 0 = 不单独设，跟着 SYNC_DAYS_AHEAD 按天走。
+CALENDAR_HOURS_AHEAD = _env_int("CALENDAR_HOURS_AHEAD", 0)
 COMPLETED_LOOKBACK_DAYS = _env_int("COMPLETED_LOOKBACK_DAYS", 14)  # 读取多久内完成的提醒
 DEFAULT_DUE_TIME = _env("DEFAULT_DUE_TIME", "09:00")    # 提醒只有日期没有时间时用它
 INCLUDE_UNDATED = _env_bool("INCLUDE_UNDATED", False)   # 没有截止日期的提醒是否当作今天
@@ -852,9 +870,19 @@ class ReminderSync:
         except ValueError:
             return False
         today = datetime.date.today()
-        return (today - datetime.timedelta(days=SYNC_DAYS_BACK)
-                <= date <=
-                today + datetime.timedelta(days=SYNC_DAYS_AHEAD))
+        if date < today - datetime.timedelta(days=SYNC_DAYS_BACK):
+            return False
+        if SYNC_DAYS_AHEAD is None:       # 不限，将来所有的都要
+            return True
+        return date <= today + datetime.timedelta(days=SYNC_DAYS_AHEAD)
+
+    @staticmethod
+    def window_text() -> str:
+        today = datetime.date.today()
+        start = today - datetime.timedelta(days=SYNC_DAYS_BACK)
+        if SYNC_DAYS_AHEAD is None:
+            return f"{start} 起，将来不限"
+        return f"{start} ~ {today + datetime.timedelta(days=SYNC_DAYS_AHEAD)}"
 
     @staticmethod
     def description_for(rem: ARem) -> str:
@@ -974,9 +1002,7 @@ class ReminderSync:
                 self.stats["created_z"] += 1
 
         if out_of_window or already_done:
-            today = datetime.date.today()
-            window = (f"{today - datetime.timedelta(days=SYNC_DAYS_BACK)} ~ "
-                      f"{today + datetime.timedelta(days=SYNC_DAYS_AHEAD)}")
+            window = self.window_text()
             if out_of_window:
                 log(f"  跳过 {out_of_window} 条提醒：不在同步范围 {window} 内"
                     f"（想扩大就调 SYNC_DAYS_AHEAD / SYNC_DAYS_BACK）")
@@ -1328,11 +1354,32 @@ class CalendarSync:
         否则匹配不上现有待办，会被当成「日历里删掉了」而删除 —— 结果就是
         会议一开始就从墨水屏上消失，EXPIRE_HOURS 那个自动划掉也永远轮不到。
         留着它们，_complete_expired 才有机会在过期后把它们划掉。
+
+        终点：设了 CALENDAR_HOURS_AHEAD 就按「现在 + N 小时」滚动，
+        否则跟着 SYNC_DAYS_AHEAD 按整天算。
         """
         now = datetime.datetime.now()
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return (midnight - datetime.timedelta(days=SYNC_DAYS_BACK),
-                midnight + datetime.timedelta(days=1 + SYNC_DAYS_AHEAD))
+        start = midnight - datetime.timedelta(days=SYNC_DAYS_BACK)
+
+        if CALENDAR_HOURS_AHEAD > 0:
+            end = now + datetime.timedelta(hours=CALENDAR_HOURS_AHEAD)
+        elif SYNC_DAYS_AHEAD is None:
+            # 提醒可以「将来不限」，日历不行 —— 会把几个月的会议全灌上墨水屏。
+            # 给个保守默认，并提示怎么显式指定。
+            end = midnight + datetime.timedelta(days=1)
+            log("    ⚠️  SYNC_DAYS_AHEAD 是不限，但日历不能不限（会把几个月的会全推上来）。"
+                "本次日历只取今天；想自己定就设 CALENDAR_HOURS_AHEAD=24")
+        else:
+            end = midnight + datetime.timedelta(days=1 + SYNC_DAYS_AHEAD)
+        return start, end
+
+    @staticmethod
+    def window_text() -> str:
+        start, end = CalendarSync.event_window()
+        if CALENDAR_HOURS_AHEAD > 0:
+            return f"{start:%m-%d %H:%M} ~ {end:%m-%d %H:%M}（现在起 {CALENDAR_HOURS_AHEAD} 小时）"
+        return f"{start:%m-%d %H:%M} ~ {end:%m-%d %H:%M}"
 
     def _complete_expired(self, todos: List[ZTodo]) -> None:
         count = 0
@@ -1572,9 +1619,10 @@ def main() -> int:
     log(f"开始同步  {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
     if args.dry_run:
         log("***** DRY RUN 模式：不会执行任何写入操作 *****")
-    today = datetime.date.today()
-    log(f"同步范围: {today - datetime.timedelta(days=SYNC_DAYS_BACK)} ~ "
-        f"{today + datetime.timedelta(days=SYNC_DAYS_AHEAD)}   删除策略: {DELETE_POLICY}")
+    log(f"提醒范围: {ReminderSync.window_text()}")
+    if CALENDAR_SOURCE != "none":
+        log(f"日历范围: {CalendarSync.window_text()}")
+    log(f"删除策略: {DELETE_POLICY}")
     log("=" * 60)
 
     if args.reset_state and not args.dry_run and os.path.exists(STATE_FILE):
