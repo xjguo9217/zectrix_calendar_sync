@@ -62,8 +62,19 @@
 
    留空 = 全部日历都同步。
 
-工作日历通常事件多，建议顺手把范围收窄一点，别把整块墨水屏刷满：
-`SYNC_DAYS_AHEAD=0` 只看今天（默认），或配合 `CALENDAR_LISTS` 只挑要紧的那个日历。
+工作日历通常事件多，建议把日历的范围单独收窄 —— 它和提醒事项是两个开关：
+
+```env
+SYNC_DAYS_AHEAD=all        # 待办：将来所有的都同步
+CALENDAR_HOURS_AHEAD=24    # 日历：只看未来 24 小时
+```
+
+日历的**起点始终是今天 00:00**，不是「现在」—— 早上开过的会要留在屏上并在
+`EXPIRE_HOURS` 后被划掉，而不是一开始就消失（这一点踩过坑）。
+`CALENDAR_HOURS_AHEAD` 只管终点。
+
+日历不支持「不限」：只写了 `SYNC_DAYS_AHEAD=all` 而没设 `CALENDAR_HOURS_AHEAD`
+时，日历会退化成只取今天并打印提示，免得几个月的会议把屏刷爆。
 
 > 学校 IT 如果锁死了 Google 账号不让加进 macOS，退路是在 Google 日历网页版
 > 「设置 → 某个日历 → 私密 iCal 地址」拿一个只读 ics 链接，然后在 macOS 日历里
@@ -129,7 +140,8 @@ CALDAV_PASS=你的密码或应用专用密码
 | `DEVICE_ID` | — | **必填**，设备 ID |
 | `API_BASE` | `https://cloud.zectrix.com/open/v1` | Zectrix API 地址 |
 | `SYNC_DAYS_BACK` | `0` | 往前几天的任务纳入同步（`1` = 也管昨天的） |
-| `SYNC_DAYS_AHEAD` | `0` | 往后几天的任务纳入同步（`0` = 只同步今天） |
+| `SYNC_DAYS_AHEAD` | `0` | 提醒事项往后看几天。`all` / `-1` = **将来不限** |
+| `CALENDAR_HOURS_AHEAD` | `0` | 日历单独按小时算的滚动窗口（`24` = 未来 24 小时）。`0` = 跟着 `SYNC_DAYS_AHEAD` 按天走 |
 | `COMPLETED_LOOKBACK_DAYS` | `14` | 读取最近多少天内完成的提醒（用来同步「划掉」） |
 | `DEFAULT_DUE_TIME` | `09:00` | 提醒只有日期没时间时用它 |
 | `INCLUDE_UNDATED` | `0` | 没有截止日期的提醒是否当作今天同步过去 |
