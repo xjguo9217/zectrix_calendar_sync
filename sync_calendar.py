@@ -478,6 +478,47 @@ class AppleRemindersError(RuntimeError):
     pass
 
 
+def responsible_app() -> str:
+    """找出 macOS 会把隐私授权归给谁。
+
+    TCC 认的是「发起进程所属的 App」，不是脚本本身。从终端跑是「终端」，
+    双击桌面按钮是「Zectrix 同步」，被别的 App 调起来又是另一个 —— 三份
+    授权互相独立。报错时不说清是哪个，很容易在设置里开了半天开错对象。
+    """
+    import re
+    import subprocess
+
+    # 取**最外层**那个 .app：链条通常是
+    #   Python.app（解释器自己的 bundle）→ zsh → Terminal.app → launchd
+    # 归属算在最外层的宿主 App 上，中间的 Python.app 不是答案。
+    found = []
+    try:
+        pid = os.getpid()
+        for _ in range(12):
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            if not out:
+                break
+            parts = out.split(None, 1)
+            if len(parts) < 2:
+                break
+            ppid, comm = parts[0], parts[1]
+            match = re.search(r"/([^/]+)\.app/", comm)
+            if match:
+                found.append(match.group(1))
+            if ppid in ("0", "1"):
+                break
+            pid = int(ppid)
+    except Exception:
+        pass
+
+    # 解释器自己的 bundle 不算宿主
+    for name in reversed(found):
+        if name not in ("Python", "python3", "Python3"):
+            return name
+    return "运行这个脚本的程序"
+
+
 def request_eventkit_access(store, entity: str) -> None:
     """申请「提醒事项」或「日历」权限，没批就抛异常。
 
@@ -508,10 +549,14 @@ def request_eventkit_access(store, entity: str) -> None:
     if not done.wait(EK_TIMEOUT):
         raise AppleRemindersError(f"等待{label}授权超时")
     if not result.get("granted"):
+        who = responsible_app()
         raise AppleRemindersError(
-            f"没有{label}访问权限。请到「系统设置 → 隐私与安全性 → {label}」，"
-            "为运行这个脚本的程序（Zectrix 同步.app / 终端）打开开关。"
-            f"（设置直达: x-apple.systempreferences:com.apple.preference.security?{pane}）"
+            f"「{who}」没有{label}访问权限。\n"
+            f"      请到「系统设置 → 隐私与安全性 → {label}」，"
+            f"打开 **{who}** 这一项（列表里没有就用 + 号添加）。\n"
+            f"      注意每个程序各有一份授权：给「Zectrix 同步」开了，不等于"
+            f"终端也有；「提醒事项」和「日历」也是两个独立开关。\n"
+            f"      设置直达: x-apple.systempreferences:com.apple.preference.security?{pane}"
         )
 
     store.refreshSourcesIfNecessary()
