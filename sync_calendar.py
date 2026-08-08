@@ -106,7 +106,21 @@ SYNC_DAYS_AHEAD = _env_days_ahead()      # None = 不限
 # 0 = 不单独设，跟着 SYNC_DAYS_AHEAD 按天走。
 CALENDAR_HOURS_AHEAD = _env_int("CALENDAR_HOURS_AHEAD", 0)
 COMPLETED_LOOKBACK_DAYS = _env_int("COMPLETED_LOOKBACK_DAYS", 14)  # 读取多久内完成的提醒
-DEFAULT_DUE_TIME = _env("DEFAULT_DUE_TIME", "09:00")    # 提醒只有日期没有时间时用它
+def _parse_hm(value: str, fallback=(9, 0)):
+    try:
+        h, m = value.split(":")[:2]
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except (ValueError, AttributeError):
+        pass
+    return fallback
+
+
+# 只有日期、没有具体时间的提醒和全天日历事件，都按这个时间放到墨水屏上。
+# 23:59 的含义是「当天之内做完」，而 09:00 会让它一早就显示成已过期。
+DEFAULT_HOUR, DEFAULT_MINUTE = _parse_hm(_env("DEFAULT_DUE_TIME", "09:00"))
+DEFAULT_DUE_TIME = f"{DEFAULT_HOUR:02d}:{DEFAULT_MINUTE:02d}"
 INCLUDE_UNDATED = _env_bool("INCLUDE_UNDATED", False)   # 没有截止日期的提醒是否当作今天
 SYNC_NEW_COMPLETED = _env_bool("SYNC_NEW_COMPLETED", False)  # 是否把「已完成」的新任务也建到对面
 TOMBSTONE_DAYS = _env_int("TOMBSTONE_DAYS", 30)
@@ -758,7 +772,7 @@ class AppleReminders:
             if not (0 <= (hour or 0) <= 23):
                 hour = None
             if hour is None or not (0 <= (minute or 0) <= 59):
-                hour, minute = [int(x) for x in DEFAULT_DUE_TIME.split(":")]
+                hour, minute = DEFAULT_HOUR, DEFAULT_MINUTE
             due_date = f"{year:04d}-{month:02d}-{day:02d}"
             due_time = f"{hour:02d}:{minute:02d}"
 
@@ -1251,7 +1265,9 @@ class AppleCalendar:
             # 谓词返回的是「与窗口有重叠」的事件，跨天的长事件开始时间可能在窗口之前
             if dt < start or dt > end:
                 continue
-            due_time = "09:00" if item.isAllDay() else dt.strftime("%H:%M")
+            # 全天事件没有具体时间，跟「只有日期的提醒」用同一个默认时间：
+            # 硬编码 09:00 会让 EXPIRE_HOURS 在上午十点就把全天事件划掉
+            due_time = DEFAULT_DUE_TIME if item.isAllDay() else dt.strftime("%H:%M")
 
             # 重复事件的每一次展开共用同一个 external id，得带上日期才唯一
             uid = str(item.calendarItemExternalIdentifier() or
@@ -1463,8 +1479,9 @@ class CalendarSync:
                 dt = dt.astimezone()
                 due_time = dt.strftime("%H:%M")
             elif isinstance(dt, datetime.date):
-                dt = datetime.datetime.combine(dt, datetime.time(9, 0)).astimezone()
-                due_time = "09:00"
+                dt = datetime.datetime.combine(
+                    dt, datetime.time(DEFAULT_HOUR, DEFAULT_MINUTE)).astimezone()
+                due_time = DEFAULT_DUE_TIME
             else:
                 continue
 

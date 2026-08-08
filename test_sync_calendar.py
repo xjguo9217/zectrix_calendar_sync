@@ -173,6 +173,71 @@ class TestTask:
     def test_normalize_time(self, raw, expected):
         assert sc._normalize_time(raw) == expected
 
+    @pytest.mark.parametrize("raw, expected", [
+        ("23:59", (23, 59)), ("09:00", (9, 0)), ("0:0", (0, 0)),
+        ("24:00", (9, 0)), ("09:60", (9, 0)),      # 越界 -> 兜底
+        ("垃圾", (9, 0)), ("", (9, 0)), (None, (9, 0)),
+    ])
+    def test_parse_hm(self, raw, expected):
+        assert sc._parse_hm(raw) == expected
+
+
+class TestDefaultDueTime:
+    """只有日期没有时间的东西，统一按 DEFAULT_DUE_TIME 落到墨水屏上。"""
+
+    def _date_only_reminder(self, when):
+        from Foundation import NSDate, NSDateComponents
+
+        class Cal:
+            def title(self): return "To Do"
+
+        class Rem:
+            def title(self): return "没设时间的事"
+            def isCompleted(self): return False
+            def calendar(self): return Cal()
+            def calendarItemIdentifier(self): return "x1"
+            def calendarItemExternalIdentifier(self): return "e1"
+            def lastModifiedDate(self): return NSDate.date()
+            def creationDate(self): return NSDate.date()
+            def dueDateComponents(self):
+                c = NSDateComponents.alloc().init()
+                c.setYear_(when.year); c.setMonth_(when.month); c.setDay_(when.day)
+                return c          # 故意不设 hour/minute
+        return Rem()
+
+    def test_date_only_reminder_uses_default(self, monkeypatch):
+        monkeypatch.setattr(sc, "DEFAULT_HOUR", 23)
+        monkeypatch.setattr(sc, "DEFAULT_MINUTE", 59)
+        monkeypatch.setattr(sc, "DEFAULT_DUE_TIME", "23:59")
+        reader = sc.AppleReminders.__new__(sc.AppleReminders)
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        rem = sc.AppleReminders._to_arem(reader, self._date_only_reminder(tomorrow), {})
+        assert rem is not None
+        assert rem.task.due_date == tomorrow.strftime("%Y-%m-%d")
+        assert rem.task.due_time == "23:59"
+
+    def test_all_day_caldav_event_uses_default_not_hardcoded_9am(self, monkeypatch):
+        """全天事件以前硬编码 09:00，结果 EXPIRE_HOURS 上午十点就把它划掉了。"""
+        monkeypatch.setattr(sc, "DEFAULT_HOUR", 23)
+        monkeypatch.setattr(sc, "DEFAULT_MINUTE", 59)
+        monkeypatch.setattr(sc, "DEFAULT_DUE_TIME", "23:59")
+        day = datetime.date.today() + datetime.timedelta(days=1)
+
+        class Item:
+            data = (
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+                f"UID:allday-1\r\nSUMMARY:放假\r\n"
+                f"DTSTART;VALUE=DATE:{day:%Y%m%d}\r\n"
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+
+        now = datetime.datetime.now().astimezone()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        out = sc.CalendarSync._parse(Item(), start, now + datetime.timedelta(days=3))
+        assert len(out) == 1
+        assert out[0]["dueTime"] == "23:59"
+        assert out[0]["dueDate"] == day.strftime("%Y-%m-%d")
+
 
 class TestWindow:
     def test_today_in_window(self):
