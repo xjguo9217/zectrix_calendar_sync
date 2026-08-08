@@ -122,6 +122,13 @@ APPLE_ADD_ALARM = _env_bool("APPLE_ADD_ALARM", False)   # 新建提醒时是否�
 #   none            两边都不删，只解绑
 DELETE_POLICY = _env("DELETE_POLICY", "apple-master")
 
+# 删某一项之前，先确认它的来源（提醒列表 / 日历）这台机器确实读到了。
+# 开着：另一台没配好账号时不会误删你在这台同步上去的东西，但那台上真删掉的
+#       项目也不会被镜像过去，得由能看到来源的机器来处理。
+# 关掉：任何一台发现某项不在了就直接删。要求两台看到的账号完全一致，
+#       否则残缺的那台会把另一台的内容清掉。
+CHECK_SOURCE_VISIBLE = _env_bool("CHECK_SOURCE_VISIBLE", True)
+
 CALENDAR_PREFIX = "[日历]"
 MAX_RETRIES = 3
 EK_TIMEOUT = 60  # EventKit 回调等待秒数
@@ -1101,7 +1108,7 @@ class ReminderSync:
             self.state.unlink(apple_id)
             return
         source_list = self.state.links.get(apple_id, {}).get("listName", "")
-        if source_list and source_list not in self.visible_lists:
+        if CHECK_SOURCE_VISIBLE and source_list and source_list not in self.visible_lists:
             log(f"  ⚠️  保留「{todo.task.title}」：这台电脑读不到它所在的提醒列表"
                 f"（{source_list}）—— 可能是本地列表或 iCloud 还没同步")
             return
@@ -1536,7 +1543,8 @@ class CalendarSync:
         for todo in unmatched:
             source_cal = self._field(todo.description, "CAL:")
             # 没有 CAL 的是老数据，这次读到了任何日历就按老规矩处理
-            if source_cal and visible is not None and source_cal not in visible:
+            if (CHECK_SOURCE_VISIBLE and source_cal
+                    and visible is not None and source_cal not in visible):
                 blocked.append((todo, source_cal))
                 continue
             log(f"    日历里已删除，同步删除: {todo.task.title}")
@@ -1622,7 +1630,10 @@ def main() -> int:
     log(f"提醒范围: {ReminderSync.window_text()}")
     if CALENDAR_SOURCE != "none":
         log(f"日历范围: {CalendarSync.window_text()}")
-    log(f"删除策略: {DELETE_POLICY}")
+    log(f"删除策略: {DELETE_POLICY}"
+        + ("" if CHECK_SOURCE_VISIBLE else
+           "  ⚠️  CHECK_SOURCE_VISIBLE=0：不检查来源可见性，"
+           "看不到某个列表/日历的机器也会照删"))
     log("=" * 60)
 
     if args.reset_state and not args.dry_run and os.path.exists(STATE_FILE):

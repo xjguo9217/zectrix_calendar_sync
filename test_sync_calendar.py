@@ -145,6 +145,8 @@ def default_policy(monkeypatch):
     monkeypatch.setattr(sc, "SYNC_DAYS_AHEAD", 0)
     monkeypatch.setattr(sc, "SYNC_NEW_COMPLETED", False)
     monkeypatch.setattr(sc, "CALENDAR_HOURS_AHEAD", 0)
+    # 别让测试跟着用户 .env 里的值跑
+    monkeypatch.setattr(sc, "CHECK_SOURCE_VISIBLE", True)
 
 
 # --------------------------------------------------------------------------
@@ -654,6 +656,37 @@ class TestCrossMachineDeleteGuard:
         zectrix, apple, engine = build(state, [todo], [], lists=["Work"])
         engine.run([todo])
         assert zectrix.todos == {}
+
+    # -- 关掉检查 ---------------------------------------------------------
+
+    def test_off_deletes_even_when_calendar_invisible(self, monkeypatch):
+        """CHECK_SOURCE_VISIBLE=0：读不到那个日历也照删。"""
+        monkeypatch.setattr(sc, "CHECK_SOURCE_VISIBLE", False)
+        todo = self._cal_todo(1, f"evt-1@{TODAY}", "xjguo@umd.edu")
+        zectrix = FakeZectrix([todo])
+        sc.CalendarSync(zectrix)._sync([], [todo], visible={"Home"})
+        assert ("delete", 1) in zectrix.calls
+
+    def test_off_deletes_even_when_reminder_list_invisible(self, state, monkeypatch):
+        monkeypatch.setattr(sc, "CHECK_SOURCE_VISIBLE", False)
+        snap = task()
+        state.link("a1", "e1", 1, snap, list_name="Daddy to do list")
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:e1", 100)
+        zectrix, apple, engine = build(state, [todo], [], lists=["Work"])
+        engine.run([todo])
+        assert zectrix.todos == {}
+
+    def test_off_still_respects_fetch_failure(self, monkeypatch):
+        """关掉的只是「来源可见性」检查。整个来源拉取失败时仍然不删 ——
+        那是两回事：一个是「我看不到这个日历」，一个是「我连不上」。"""
+        monkeypatch.setattr(sc, "CHECK_SOURCE_VISIBLE", False)
+        monkeypatch.setattr(sc, "CALENDAR_SOURCE", "both")
+        monkeypatch.setattr(sc, "CALDAV_PASS", "x")
+        syncer = sc.CalendarSync(FakeZectrix())
+        monkeypatch.setattr(syncer, "_fetch_from_eventkit",
+                            lambda: (_ for _ in ()).throw(sc.AppleRemindersError("没权限")))
+        monkeypatch.setattr(syncer, "_fetch_from_caldav", lambda: None)
+        assert syncer._collect_events() is None    # None -> 上层跳过删除
 
     def test_list_name_is_recorded_on_link(self, state):
         rem = ARem("a1", "e1", task("买牛奶"), 100, "shopping")
