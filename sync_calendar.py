@@ -35,9 +35,12 @@ from icalendar import Calendar
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # 默认不覆盖已存在的环境变量，所以 FOO=1 ./run.sh 能临时改配置
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
-    pass
+    if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+        print("⚠️  有 .env 但没装 python-dotenv，配置读不到："
+              "pip install python-dotenv", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -250,10 +253,14 @@ class SyncState:
 
     # -- 配对操作 ---------------------------------------------------------
 
-    def link(self, apple_id: str, ext_id: str, zectrix_id: int, snapshot: Task) -> None:
+    def link(self, apple_id: str, ext_id: str, zectrix_id: int, snapshot: Task,
+             list_name: str = "") -> None:
+        # listName 用来判断「这台电脑看不到这个列表」，避免跨机器误删
+        previous = self.links.get(apple_id, {})
         self.links[apple_id] = {
             "zectrixId": zectrix_id,
             "extId": ext_id,
+            "listName": list_name or previous.get("listName", ""),
             "snapshot": snapshot.to_dict(),
             "updatedAt": datetime.datetime.now().isoformat(timespec="seconds"),
         }
@@ -538,7 +545,25 @@ class AppleReminders:
 
         if not self._calendars:
             raise AppleRemindersError("没有可用的提醒事项列表")
-        log(f"Apple: 读取列表 {', '.join(str(c.title()) for c in self._calendars)}")
+
+        # 带上所属账户：如果是「我的 Mac」这类本地列表，它根本不跨设备同步，
+        # 换台电脑就看不到 —— 这是多机使用时最容易踩的坑
+        described = []
+        local = []
+        for cal in self._calendars:
+            source = cal.source()
+            account = str(source.title()) if source else "?"
+            described.append(f"{str(cal.title())}（{account}）")
+            if account in ("Local", "On My Mac", "我的 Mac"):
+                local.append(str(cal.title()))
+        log(f"Apple: 读取列表 {', '.join(described)}")
+        if local:
+            log(f"  ⚠️  这些是本机列表，不会同步到你的其他 Mac: {', '.join(local)}")
+            log("      多台电脑一起用的话，把提醒挪到 iCloud 账户下的列表里。")
+
+    def list_names(self) -> List[str]:
+        """这次真正读到的提醒列表名，用于删除判断。"""
+        return [str(c.title()) for c in (self._calendars or [])]
 
     def _target_calendar(self):
         """新建提醒放哪个列表。"""
@@ -568,10 +593,16 @@ class AppleReminders:
         return box.get("items", [])
 
     def fetch_all(self) -> List[ARem]:
-        """全部未完成提醒 + 最近 COMPLETED_LOOKBACK_DAYS 天内完成的提醒。"""
+        """未完成提醒 + 最近 COMPLETED_LOOKBACK_DAYS 天内完成的提醒。
+
+        注意 predicateForIncompleteReminders...(nil, nil, ...) 只返回**设了截止
+        日期**的提醒，没日期的一条都拿不到。所以再用 predicateForRemindersInCalendars_
+        兜一次底，把没日期的捞回来 —— 不然「我明明有一堆提醒，怎么同步说 0 条」
+        根本无从查起。
+        """
         from Foundation import NSDate
 
-        incomplete = self._fetch(
+        dated = self._fetch(
             self.store.predicateForIncompleteRemindersWithDueDateStarting_ending_calendars_(
                 None, None, self._calendars)
         )
@@ -585,14 +616,28 @@ class AppleReminders:
                 self._calendars)
         )
 
-        log(f"Apple: 读取到 {len(incomplete)} 条未完成 + "
-            f"{len(completed)} 条最近 {COMPLETED_LOOKBACK_DAYS} 天内完成的提醒")
+        seen_ids = {str(i.calendarItemIdentifier()) for i in dated + completed}
+        undated = [
+            item for item in self._fetch(
+                self.store.predicateForRemindersInCalendars_(self._calendars))
+            if not item.isCompleted()
+            and item.dueDateComponents() is None
+            and str(item.calendarItemIdentifier()) not in seen_ids
+        ]
 
-        out = []
-        for item in incomplete + completed:
-            parsed = self._to_arem(item)
+        log(f"Apple: 未完成 {len(dated)} 条（有日期）+ {len(undated)} 条（没日期）"
+            f"，最近 {COMPLETED_LOOKBACK_DAYS} 天内完成 {len(completed)} 条")
+
+        out, skipped = [], {"没有截止日期": 0, "日期无法解析": 0, "没有标题": 0}
+        for item in dated + completed + undated:
+            parsed = self._to_arem(item, skipped)
             if parsed is not None:
                 out.append(parsed)
+
+        for reason, count in skipped.items():
+            if count:
+                hint = "（想同步的话设 INCLUDE_UNDATED=1）" if reason == "没有截止日期" else ""
+                log(f"    跳过 {count} 条：{reason}{hint}")
         return out
 
     def lookup(self, apple_id: str, ext_id: str = "") -> Optional[ARem]:
@@ -603,22 +648,27 @@ class AppleReminders:
             item = items[0] if items else None
         return self._to_arem(item) if item is not None else None
 
-    def _to_arem(self, item) -> Optional[ARem]:
+    def _to_arem(self, item, skipped: Optional[Dict[str, int]] = None) -> Optional[ARem]:
+        def skip(reason: str):
+            if skipped is not None:
+                skipped[reason] = skipped.get(reason, 0) + 1
+            return None
+
         title = str(item.title() or "").strip()
         if not title:
-            return None
+            return skip("没有标题")
 
         due = item.dueDateComponents()
         if due is None:
             if not INCLUDE_UNDATED:
-                return None
+                return skip("没有截止日期")
             today = datetime.date.today()
             due_date, due_time = today.strftime("%Y-%m-%d"), DEFAULT_DUE_TIME
         else:
             year, month, day = due.year(), due.month(), due.day()
             # NSDateComponents 里没设置的字段是 NSUndefinedDateComponent (一个很大的负数)
             if not (1 <= (month or 0) <= 12 and 1 <= (day or 0) <= 31 and (year or 0) > 1970):
-                return None
+                return skip("日期无法解析")
             hour, minute = due.hour(), due.minute()
             if not (0 <= (hour or 0) <= 23):
                 hour = None
@@ -731,6 +781,7 @@ class ReminderSync:
         self.stats = {"created_z": 0, "created_a": 0, "updated_z": 0, "updated_a": 0,
                       "deleted_z": 0, "deleted_a": 0, "conflicts": 0, "unlinked": 0}
         self.summary = "提醒事项：未运行"
+        self.visible_lists: set = set()
 
     # -- 辅助 -------------------------------------------------------------
 
@@ -786,7 +837,7 @@ class ReminderSync:
             if rem is None or rem.apple_id in self.state.links:
                 continue
             # 用当前 Zectrix 内容当快照：无法判断谁改过，先以 Apple 为准把两边对齐
-            self.state.link(rem.apple_id, rem.ext_id, todo.todo_id, todo.task)
+            self.state.link(rem.apple_id, rem.ext_id, todo.todo_id, todo.task, rem.list_name)
             recovered += 1
         if recovered:
             log(f"从待办备注里认回了 {recovered} 条已有配对")
@@ -798,6 +849,11 @@ class ReminderSync:
         a_by_id = {r.apple_id: r for r in reminders}
         a_by_ext = {r.ext_id: r for r in reminders if r.ext_id}
         z_by_id = {t.todo_id: t for t in z_todos}
+
+        # 删除判断和日历同理：只有当这条提醒原本所在的列表「这次确实读到了」，
+        # 它的消失才算真的被删。配对时记下了列表名，这里核对一遍。
+        # 不能用「读到 0 条」判断 —— 那台可能读到了别的列表、结果非空，照样误删。
+        self.visible_lists = set(self.apple.list_names())
 
         self.state.prune_tombstones()
         self._migrate_from_descriptions(z_todos, a_by_id, a_by_ext)
@@ -822,7 +878,7 @@ class ReminderSync:
             # Apple 那边标识符变了（iCloud 首次同步会改），顺手修正
             if rem is not None and rem.apple_id != apple_id:
                 self.state.unlink(apple_id)
-                self.state.link(rem.apple_id, rem.ext_id, zectrix_id, snapshot)
+                self.state.link(rem.apple_id, rem.ext_id, zectrix_id, snapshot, rem.list_name)
                 apple_id = rem.apple_id
 
             handled_apple.add(apple_id)
@@ -836,23 +892,37 @@ class ReminderSync:
         # 2. Apple 有、Zectrix 没有 —— 新建到 Zectrix
         linked_apple = set(self.state.links.keys()) | handled_apple
         linked_ext = {l.get("extId") for l in self.state.links.values()} | handled_ext
+        out_of_window = already_done = 0
         for rem in reminders:
             if rem.apple_id in linked_apple or (rem.ext_id and rem.ext_id in linked_ext):
                 continue
             if rem.apple_id in self.state.tomb_apple:
                 continue
             if not self.in_window(rem.task.due_date):
+                out_of_window += 1
                 continue
             if rem.task.completed and not SYNC_NEW_COMPLETED:
+                already_done += 1
                 continue
             log(f"  新提醒 -> 墨水屏: {rem.task.describe()}")
             description = self.description_for(rem)
             todo_id = self.zectrix.create(rem.task, description)
             if todo_id:
-                self.state.link(rem.apple_id, rem.ext_id, todo_id, rem.task)
+                self.state.link(rem.apple_id, rem.ext_id, todo_id, rem.task, rem.list_name)
                 self.stats["created_z"] += 1
             elif self.dry_run:
                 self.stats["created_z"] += 1
+
+        if out_of_window or already_done:
+            today = datetime.date.today()
+            window = (f"{today - datetime.timedelta(days=SYNC_DAYS_BACK)} ~ "
+                      f"{today + datetime.timedelta(days=SYNC_DAYS_AHEAD)}")
+            if out_of_window:
+                log(f"  跳过 {out_of_window} 条提醒：不在同步范围 {window} 内"
+                    f"（想扩大就调 SYNC_DAYS_AHEAD / SYNC_DAYS_BACK）")
+            if already_done:
+                log(f"  跳过 {already_done} 条提醒：已完成且还没配过对"
+                    f"（想同步的话设 SYNC_NEW_COMPLETED=1）")
 
         # 3. Zectrix 有、Apple 没有 —— 新建到提醒事项
         linked_zectrix = set(self.state.zectrix_ids().keys()) | handled_zectrix
@@ -870,7 +940,7 @@ class ReminderSync:
             log(f"  新待办 -> 提醒事项: {todo.task.describe()}")
             rem = self.apple.create(todo.task)
             if rem is not None:
-                self.state.link(rem.apple_id, rem.ext_id, todo.todo_id, todo.task)
+                self.state.link(rem.apple_id, rem.ext_id, todo.todo_id, todo.task, rem.list_name)
                 # 把 Apple 锚点回写到备注：状态文件丢了、或换台电脑跑，都能靠它认回来
                 self.zectrix.update_fields(todo.todo_id, todo.task,
                                            self.description_for(rem))
@@ -904,7 +974,7 @@ class ReminderSync:
             return
 
         if todo.task == rem.task:            # 两边改成了一样的
-            self.state.link(apple_id, rem.ext_id, zectrix_id, rem.task)
+            self.state.link(apple_id, rem.ext_id, zectrix_id, rem.task, rem.list_name)
             return
 
         if z_changed and a_changed:
@@ -920,12 +990,12 @@ class ReminderSync:
         if winner == "apple":
             log(f"  提醒事项 -> 墨水屏: {todo.task.describe()} => {rem.task.describe()}")
             if self._push_to_zectrix(todo, rem.task, rem):
-                self.state.link(apple_id, rem.ext_id, zectrix_id, rem.task)
+                self.state.link(apple_id, rem.ext_id, zectrix_id, rem.task, rem.list_name)
                 self.stats["updated_z"] += 1
         else:
             log(f"  墨水屏 -> 提醒事项: {rem.task.describe()} => {todo.task.describe()}")
             if self.apple.update(rem, todo.task):
-                self.state.link(apple_id, rem.ext_id, zectrix_id, todo.task)
+                self.state.link(apple_id, rem.ext_id, zectrix_id, todo.task, rem.list_name)
                 self.stats["updated_a"] += 1
 
     def _push_to_zectrix(self, todo: ZTodo, task: Task, rem: ARem) -> bool:
@@ -943,6 +1013,11 @@ class ReminderSync:
                               todo: Optional[ZTodo]) -> None:
         if todo is None:
             self.state.unlink(apple_id)
+            return
+        source_list = self.state.links.get(apple_id, {}).get("listName", "")
+        if source_list and source_list not in self.visible_lists:
+            log(f"  ⚠️  保留「{todo.task.title}」：这台电脑读不到它所在的提醒列表"
+                f"（{source_list}）—— 可能是本地列表或 iCloud 还没同步")
             return
         if DELETE_POLICY in ("apple-master", "mirror"):
             log(f"  提醒事项已删除 -> 墨水屏同步删除: {todo.task.title}")
@@ -1096,8 +1171,12 @@ class AppleCalendar:
                 "title": title,
                 "dueDate": dt.strftime("%Y-%m-%d"),
                 "dueTime": due_time,
+                "calendar": str(item.calendar().title()) if item.calendar() else "",
             })
         return events
+
+    def calendar_names(self) -> List[str]:
+        return [str(c.title()) for c in self._calendars]
 
 
 class CalendarSync:
@@ -1113,29 +1192,36 @@ class CalendarSync:
         self._complete_expired([t for t in calendar_todos if not t.task.completed])
 
         log("\n  [2/2] 拉取日历事件...")
-        events = self._collect_events()
-        if events is None:
+        collected = self._collect_events()
+        if collected is None:
             log("  所有日历来源都拉取失败，跳过本次日历同步（不做删除，避免误删）")
             self.summary = "日历：拉取失败"
             return
-        self._sync(events, calendar_todos)
+        events, visible = collected
+        self._sync(events, calendar_todos, visible)
 
-    def _collect_events(self) -> Optional[List[Dict]]:
+    def _collect_events(self) -> Optional[Tuple[List[Dict], set]]:
         """按 CALENDAR_SOURCE 从各来源取事件，按 UID 去重。
 
-        同一条 iCloud 事件从 EventKit 和 CalDAV 两边都能拿到，UID 是一样的，
-        所以 both 模式不会在墨水屏上出现两遍。
-        任何一个来源挂了都只是少一部分事件；只有全挂了才返回 None（那时不做删除）。
+        除了事件本身，还要返回「这次真正读到了哪些日历」。删除判断靠它：
+        只有当某条日程所属的日历这次确实读到了，它的消失才算「日历里删了」。
+        另一台没配 UMD 账号的电脑读不到那个日历，就不会去删它的日程 ——
+        用「事件数是不是 0」判断是不行的，那台可能读到了别的日历、结果非空，
+        照样会误删。
+
+        任何一个来源挂了都只是少一部分事件；只有全挂了才返回 None。
         """
         sources_ok = 0
         merged: Dict[str, Dict] = {}
+        visible: set = set()
 
         if CALENDAR_SOURCE in ("eventkit", "both"):
             log("    来源: macOS 日历 (EventKit)")
             try:
-                events = self._fetch_from_eventkit()
+                events, names = self._fetch_from_eventkit()
                 for event in events:
                     merged.setdefault(event["uid"], event)
+                visible.update(names)
                 log(f"    macOS 日历取到 {len(events)} 个事件")
                 sources_ok += 1
             except ImportError:
@@ -1148,28 +1234,31 @@ class CalendarSync:
                 log("    未配置 CALDAV_PASS，跳过 CalDAV")
             else:
                 log("    来源: CalDAV")
-                events = self._fetch_from_caldav()
-                if events is None:
+                fetched = self._fetch_from_caldav()
+                if fetched is None:
                     log("    ⚠️  CalDAV 拉取失败")
                 else:
+                    events, names = fetched
                     added = 0
                     for event in events:
                         if event["uid"] not in merged:
                             merged[event["uid"]] = event
                             added += 1
+                    visible.update(names)
                     log(f"    CalDAV 取到 {len(events)} 个事件（去重后新增 {added}）")
                     sources_ok += 1
 
         if sources_ok == 0:
             return None
-        log(f"    合计 {len(merged)} 个日程")
-        return list(merged.values())
+        log(f"    合计 {len(merged)} 个日程，读到的日历: "
+            f"{', '.join(sorted(visible)) if visible else '（无）'}")
+        return list(merged.values()), visible
 
-    def _fetch_from_eventkit(self) -> List[Dict]:
+    def _fetch_from_eventkit(self) -> Tuple[List[Dict], List[str]]:
         calendar = AppleCalendar()
         calendar.connect()
         start, end = self.event_window()
-        return calendar.fetch_events(start, end)
+        return calendar.fetch_events(start, end), calendar.calendar_names()
 
     @staticmethod
     def event_window() -> Tuple[datetime.datetime, datetime.datetime]:
@@ -1201,7 +1290,7 @@ class CalendarSync:
                     count += 1
         log(f"    共划掉 {count} 个过期日程")
 
-    def _fetch_from_caldav(self) -> Optional[List[Dict]]:
+    def _fetch_from_caldav(self) -> Optional[Tuple[List[Dict], List[str]]]:
         def _fetch():
             import caldav
 
@@ -1210,18 +1299,26 @@ class CalendarSync:
             calendars = client.principal().calendars()
             if not calendars:
                 log("    未找到任何日历")
-                return []
+                return [], []
 
             start, end = self.event_window()
             start = start.astimezone()
             end = end.astimezone()
 
             events: List[Dict] = []
+            names: List[str] = []
             for calendar in calendars:
+                try:
+                    name = str(calendar.get_display_name() or calendar.url)
+                except Exception:
+                    name = str(calendar.url)
+                names.append(name)
                 found = calendar.search(start=start, end=end, event=True, expand=True)
                 for item in found:
-                    events.extend(self._parse(item, start, end))
-            return events
+                    for event in self._parse(item, start, end):
+                        event["calendar"] = name
+                        events.append(event)
+            return events, names
 
         return retry(_fetch)
 
@@ -1271,7 +1368,16 @@ class CalendarSync:
             })
         return out
 
-    def _sync(self, events: List[Dict], calendar_todos: List[ZTodo]) -> None:
+    @staticmethod
+    def _field(description: str, prefix: str) -> str:
+        for line in (description or "").split("\n"):
+            line = line.strip()
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
+        return ""
+
+    def _sync(self, events: List[Dict], calendar_todos: List[ZTodo],
+              visible: Optional[set] = None) -> None:
         remaining: Dict[str, ZTodo] = {}
         for todo in calendar_todos:
             stored = ReminderSync._uid_from_description(todo.description)
@@ -1287,7 +1393,10 @@ class CalendarSync:
                         due_date=event["dueDate"],
                         due_time=event["dueTime"],
                         completed=False)
+            # CAL 记住来自哪个日历：换台电脑看不到这个日历时，就不会误删它
             description = f"SOURCE: calendar\nUID: {uid}"
+            if event.get("calendar"):
+                description += f"\nCAL: {event['calendar']}"
 
             # 老版本备注里存的是不带日期的裸 UID，也认，
             # 免得升级之后所有日程被当成「日历里没了」删掉再重建一遍
@@ -1309,12 +1418,30 @@ class CalendarSync:
                 if self.zectrix.update_fields(existing.todo_id, task, description):
                     updated += 1
 
-        for key, todo in remaining.items():
-            if key in matched or todo.task.completed:
+        # 删除判断：只有当这条日程所属的日历「这次确实读到了」，
+        # 它的消失才算真的被删。看不到那个日历就不动它 —— 那是另一台电脑
+        # 同步上来的内容，不是这台有权处置的。
+        # 注意不能用「事件数是不是 0」来判断：今天一个会都没有是完全正常的，
+        # 而另一台读到了别的日历、结果非空，照样会误删。
+        unmatched = [t for k, t in remaining.items()
+                     if k not in matched and not t.task.completed]
+        blocked = []
+        for todo in unmatched:
+            source_cal = self._field(todo.description, "CAL:")
+            # 没有 CAL 的是老数据，这次读到了任何日历就按老规矩处理
+            if source_cal and visible is not None and source_cal not in visible:
+                blocked.append((todo, source_cal))
                 continue
             log(f"    日历里已删除，同步删除: {todo.task.title}")
             if self.zectrix.delete(todo.todo_id):
                 deleted += 1
+
+        if blocked:
+            cals = sorted({c for _, c in blocked})
+            log(f"    ⚠️  保留 {len(blocked)} 条日程：这台电脑读不到它们所在的日历"
+                f"（{', '.join(cals)}）")
+            log("        如果确实想在这台管它们，去「系统设置 → 互联网账户」"
+                "把对应账号加上，或检查 CALENDAR_LISTS。")
 
         log(f"\n日历同步结果: 新建 {created}，更新 {updated}，删除 {deleted}")
 

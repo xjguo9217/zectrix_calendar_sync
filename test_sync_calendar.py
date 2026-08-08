@@ -75,11 +75,19 @@ class FakeZectrix:
 class FakeApple:
     """在内存里模拟 Apple 提醒事项。"""
 
-    def __init__(self, reminders=None, dry_run=False):
+    def __init__(self, reminders=None, dry_run=False, lists=None):
         self.dry_run = dry_run
         self.items = {r.apple_id: r for r in (reminders or [])}
         self._next = 1
         self.calls = []
+        # 这台机器「读到了哪些列表」——删除判断靠它，和列表里有没有内容无关
+        self._lists = lists
+
+    def list_names(self):
+        if self._lists is not None:
+            return list(self._lists)
+        names = {r.list_name for r in self.items.values() if r.list_name}
+        return sorted(names) or ["提醒事项"]
 
     def fetch_all(self):
         return list(self.items.values())
@@ -123,9 +131,9 @@ def state(tmp_path):
     return SyncState(str(tmp_path / "state.json"))
 
 
-def build(state, z_todos=(), reminders=(), dry_run=False):
+def build(state, z_todos=(), reminders=(), dry_run=False, lists=None):
     zectrix = FakeZectrix(z_todos, dry_run=dry_run)
-    apple = FakeApple(reminders, dry_run=dry_run)
+    apple = FakeApple(reminders, dry_run=dry_run, lists=lists)
     engine = ReminderSync(zectrix, apple, state, dry_run=dry_run)
     return zectrix, apple, engine
 
@@ -223,6 +231,37 @@ class TestCreate:
         zectrix, apple, engine = build(state, reminders=[rem])
         engine.run([])
         assert zectrix.todos == {}
+
+    def test_out_of_window_is_reported_not_silent(self, state, capsys):
+        """回归：被过滤掉的提醒必须说出来。
+
+        之前全是静默丢弃，日志只显示「新建 0」，用户看到「同步成功但什么都没发生」
+        完全无从查起 —— 实际原因是窗口只有今天、提醒都不是今天到期。
+        """
+        rems = [ARem(f"a{i}", f"e{i}", task(f"任务{i}", date=TOMORROW), 100, "提醒事项")
+                for i in range(3)]
+        zectrix, apple, engine = build(state, reminders=rems)
+        engine.run([])
+
+        out = capsys.readouterr().out
+        assert "跳过 3 条提醒" in out
+        assert "不在同步范围" in out
+        assert "SYNC_DAYS_AHEAD" in out          # 得告诉用户怎么改
+
+    def test_skipped_completed_is_reported(self, state, capsys):
+        rem = ARem("a1", "e1", task(completed=True), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+
+        out = capsys.readouterr().out
+        assert "跳过 1 条提醒" in out
+        assert "SYNC_NEW_COMPLETED" in out
+
+    def test_nothing_skipped_stays_quiet(self, state, capsys):
+        rem = ARem("a1", "e1", task("今天的事"), 100, "提醒事项")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        assert "跳过" not in capsys.readouterr().out
 
     def test_completed_new_item_synced_when_enabled(self, state, monkeypatch):
         monkeypatch.setattr(sc, "SYNC_NEW_COMPLETED", True)
@@ -384,7 +423,10 @@ class TestDeletion:
         snap = task()
         state.link("a1", "e1", 1, snap)
         todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
-        zectrix, apple, engine = build(state, [todo], [])   # Apple 里没有了
+        # 留一条别的提醒：证明这次「读到了」，a1 是真的被删了，
+        # 而不是整个列表都看不见（那种情况有专门的保护，见 TestEmptyReadGuard）
+        other = ARem("a2", "e2", task("别的事", date=TOMORROW), 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [other])
         engine.run([todo])
 
         assert zectrix.todos == {}
@@ -432,7 +474,8 @@ class TestDeletion:
         snap = task()
         state.link("a1", "e1", 1, snap)
         todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:a1", 100)
-        zectrix, apple, engine = build(state, [todo], [])
+        other = ARem("a2", "e2", task("别的事", date=TOMORROW), 100, "提醒事项")
+        zectrix, apple, engine = build(state, [todo], [other])
         engine.run([todo])
 
         assert zectrix.todos == {1: todo}
@@ -444,6 +487,113 @@ class TestDeletion:
         engine.run([])
         assert state.links == {}
         assert state.tomb_apple == {}
+
+
+# --------------------------------------------------------------------------
+# 「读到空」不授权删除
+# --------------------------------------------------------------------------
+
+class TestCrossMachineDeleteGuard:
+    """一台看不到某个日历/列表的机器，不许删那里来的东西。
+
+    实际踩到的两个坑，方向相反，必须同时成立：
+      A) 新装的第二台没加 UMD 账号 -> 不能把第一台同步上去的 UMD 日程删掉
+      B) 但「今天一个会都没有」是完全正常的 -> 该删的还是要删
+
+    所以判据是「这个日历这次读到了没有」，不是「读到的事件数是不是 0」——
+    后者既挡不住 A（那台可能读到别的日历、结果非空），又会误伤 B。
+    """
+
+    # -- 日历 -------------------------------------------------------------
+
+    def _cal_todo(self, todo_id, uid, cal, title="[日历] 组会"):
+        desc = f"SOURCE: calendar\nUID: {uid}"
+        if cal:
+            desc += f"\nCAL: {cal}"
+        return ZTodo(todo_id, Task(title, TODAY, "10:00", False), desc, 100)
+
+    def test_invisible_calendar_is_not_deleted(self, capsys):
+        """A：读不到 UMD 那个日历，就不能删它的日程。"""
+        todo = self._cal_todo(1, f"evt-1@{TODAY}", "xjguo@umd.edu")
+        zectrix = FakeZectrix([todo])
+        sc.CalendarSync(zectrix)._sync([], [todo], visible={"Home", "Work"})
+
+        assert zectrix.calls == []
+        out = capsys.readouterr().out
+        assert "保留 1 条日程" in out
+        assert "xjguo@umd.edu" in out
+
+    def test_empty_day_on_visible_calendar_still_deletes(self, capsys):
+        """B：日历读到了、今天就是没有会 —— 该删。这条是用户实际报的 bug。"""
+        todo = self._cal_todo(1, f"evt-1@{TODAY}", "Home")
+        zectrix = FakeZectrix([todo])
+        sc.CalendarSync(zectrix)._sync([], [todo], visible={"Home", "Work"})
+
+        assert ("delete", 1) in zectrix.calls
+        assert "保留" not in capsys.readouterr().out
+
+    def test_legacy_todo_without_cal_field_still_deletes(self):
+        """老数据没有 CAL 字段，按老规矩处理，不然永远删不掉。"""
+        todo = self._cal_todo(1, f"evt-1@{TODAY}", None)
+        zectrix = FakeZectrix([todo])
+        sc.CalendarSync(zectrix)._sync([], [todo], visible={"Home"})
+        assert ("delete", 1) in zectrix.calls
+
+    def test_mixed_visibility_deletes_only_the_visible_one(self):
+        mine = self._cal_todo(1, f"evt-1@{TODAY}", "Home", "[日历] 本机的会")
+        theirs = self._cal_todo(2, f"evt-2@{TODAY}", "xjguo@umd.edu", "[日历] UMD 的会")
+        zectrix = FakeZectrix([mine, theirs])
+        sc.CalendarSync(zectrix)._sync([], [mine, theirs], visible={"Home"})
+
+        assert ("delete", 1) in zectrix.calls
+        assert ("delete", 2) not in zectrix.calls
+
+    def test_cal_field_is_written_on_create(self):
+        zectrix = FakeZectrix()
+        sc.CalendarSync(zectrix)._sync(
+            [{"uid": f"evt-1@{TODAY}", "title": "组会", "dueDate": TODAY,
+              "dueTime": "10:00", "calendar": "xjguo@umd.edu"}], [], visible={"xjguo@umd.edu"})
+        _, _, description = zectrix.calls[0]
+        assert "CAL: xjguo@umd.edu" in description
+
+    # -- 提醒事项 ---------------------------------------------------------
+
+    def test_invisible_reminder_list_is_not_deleted(self, state, capsys):
+        """配对时记下了列表名；这台读不到那个列表，就不能删。"""
+        snap = task()
+        state.link("a1", "e1", 1, snap, list_name="Daddy to do list")
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:e1", 100)
+        # 这台只读到 Work，提醒 a1 读不到
+        zectrix, apple, engine = build(state, [todo], [], lists=["Work"])
+        engine.run([todo])
+
+        assert zectrix.calls == []
+        assert "a1" in state.links
+        out = capsys.readouterr().out
+        assert "Daddy to do list" in out
+
+    def test_visible_list_with_no_reminders_still_deletes(self, state):
+        """列表读到了、里面确实空了 —— 该删。"""
+        snap = task()
+        state.link("a1", "e1", 1, snap, list_name="Work")
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:e1", 100)
+        zectrix, apple, engine = build(state, [todo], [], lists=["Work"])
+        engine.run([todo])
+        assert zectrix.todos == {}
+
+    def test_legacy_link_without_list_name_still_deletes(self, state):
+        snap = task()
+        state.link("a1", "e1", 1, snap)          # 老状态文件没有 listName
+        todo = ZTodo(1, snap, "SOURCE: apple\nUID: reminder:e1", 100)
+        zectrix, apple, engine = build(state, [todo], [], lists=["Work"])
+        engine.run([todo])
+        assert zectrix.todos == {}
+
+    def test_list_name_is_recorded_on_link(self, state):
+        rem = ARem("a1", "e1", task("买牛奶"), 100, "shopping")
+        zectrix, apple, engine = build(state, reminders=[rem])
+        engine.run([])
+        assert state.links["a1"]["listName"] == "shopping"
 
 
 # --------------------------------------------------------------------------
@@ -737,14 +887,21 @@ class TestCalendarSources:
         def fake_ek():
             if isinstance(eventkit, Exception):
                 raise eventkit
-            return eventkit or []
+            evs = eventkit or []
+            return evs, sorted({e.get("calendar", "日历") for e in evs}) or ["日历"]
+
+        def fake_caldav():
+            if caldav is None:
+                return None
+            return caldav, sorted({e.get("calendar", "CalDAV") for e in caldav})
 
         monkeypatch.setattr(syncer, "_fetch_from_eventkit", fake_ek)
-        monkeypatch.setattr(syncer, "_fetch_from_caldav", lambda: caldav)
+        monkeypatch.setattr(syncer, "_fetch_from_caldav", fake_caldav)
         return syncer
 
-    def _event(self, uid, title):
-        return {"uid": uid, "title": title, "dueDate": TODAY, "dueTime": "10:00"}
+    def _event(self, uid, title, cal="日历"):
+        return {"uid": uid, "title": title, "dueDate": TODAY,
+                "dueTime": "10:00", "calendar": cal}
 
     def test_both_sources_dedup_by_uid(self, monkeypatch):
         """同一条 iCloud 事件两边都能拿到，墨水屏上不能出现两次。"""
@@ -752,7 +909,7 @@ class TestCalendarSources:
         only_google = self._event("google-1@" + TODAY, "UMD 课")
         syncer = self._syncer(monkeypatch, "both",
                               eventkit=[shared, only_google], caldav=[shared])
-        events = syncer._collect_events()
+        events, visible = syncer._collect_events()
         assert len(events) == 2
         assert {e["uid"] for e in events} == {shared["uid"], only_google["uid"]}
 
@@ -760,14 +917,14 @@ class TestCalendarSources:
         syncer = self._syncer(monkeypatch, "eventkit",
                               eventkit=[self._event("a@" + TODAY, "会")],
                               caldav=[self._event("b@" + TODAY, "不该出现")])
-        events = syncer._collect_events()
+        events, visible = syncer._collect_events()
         assert [e["title"] for e in events] == ["会"]
 
     def test_one_source_failing_still_returns_the_other(self, monkeypatch):
         syncer = self._syncer(monkeypatch, "both",
                               eventkit=sc.AppleRemindersError("没权限"),
                               caldav=[self._event("b@" + TODAY, "CalDAV 的会")])
-        events = syncer._collect_events()
+        events, visible = syncer._collect_events()
         assert [e["title"] for e in events] == ["CalDAV 的会"]
 
     def test_all_sources_failing_returns_none(self, monkeypatch):
@@ -780,7 +937,7 @@ class TestCalendarSources:
         syncer = self._syncer(monkeypatch, "both",
                               eventkit=ImportError("no pyobjc"),
                               caldav=[self._event("b@" + TODAY, "会")])
-        assert len(syncer._collect_events()) == 1
+        assert len(syncer._collect_events()[0]) == 1
 
 
 class TestCalendarSyncMatching:
@@ -816,10 +973,14 @@ class TestCalendarSyncMatching:
 
     def test_vanished_event_is_deleted(self):
         gone = self._todo(1, f"evt-1@{TODAY}")
-        zectrix = FakeZectrix([gone])
-        syncer = sc.CalendarSync(zectrix)
-        syncer._sync([], [gone])
-        assert zectrix.kinds() == ["delete"]
+        alive = self._todo(2, f"evt-2@{TODAY}", title="[日历] 还在的会")
+        zectrix = FakeZectrix([gone, alive])
+        # 取到了 evt-2，说明日历读得到；evt-1 是真没了
+        sc.CalendarSync(zectrix)._sync(
+            [{"uid": f"evt-2@{TODAY}", "title": "还在的会",
+              "dueDate": TODAY, "dueTime": "10:00"}], [gone, alive])
+        assert ("delete", 1) in zectrix.calls
+        assert ("delete", 2) not in zectrix.calls
 
     def test_completed_calendar_todo_is_not_deleted(self):
         """已经划掉的过期日程不该再被删一次。"""
